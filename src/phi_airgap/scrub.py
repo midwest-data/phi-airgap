@@ -20,6 +20,10 @@ from fnmatch import fnmatch
 REDACT = "<REDACTED:{}>"
 SUPPRESSED = "<11"
 
+# Names no allow_columns pattern may launder: `*_month` must not admit
+# `birth_month`, `*_year` must not admit `age_year`. Shared with the gate.
+HARD_DENY = re.compile(r"birth|dob|death|^age$|^age_|_age$")
+
 # Deliberately narrow. DATE_TIME and LOCATION are omitted: they fire on every
 # reporting month and every hospital name, and the real Safe Harbor exposures
 # they would catch (DOB, patient address) are already denied structurally by
@@ -162,7 +166,7 @@ def check_columns(
     bad = []
     for col in columns:
         name = col.lower()
-        if any(fnmatch(name, p) for p in allow):
+        if not HARD_DENY.search(name) and any(fnmatch(name, p) for p in allow):
             continue
         for pattern in deny_patterns:
             if fnmatch(name, pattern.lower()):
@@ -208,6 +212,8 @@ def suppress(
     k: int,
     count_patterns: list[str],
     group_keys: set[str],
+    count_idx: set[int] | None = None,
+    key_idx: set[int] | None = None,
 ) -> tuple[int, int]:
     """k-anonymity suppression, in place. Returns (cells changed, rows hit).
 
@@ -217,11 +223,20 @@ def suppress(
     was blanked, every marginal row (group keys all literal totals) is blanked
     too, or the suppressed cell is recoverable by subtraction.
     """
-    count_idx = [i for i, c in enumerate(columns) if _is_count_col(c, count_patterns)]
+    # By name (policy patterns, verdict aliases) AND by output position (the
+    # verdict): an unaliased `count(1)` comes back named whatever the warehouse
+    # chose, and name matching alone silently skipped suppression for it.
+    count_idx = sorted(
+        {i for i, c in enumerate(columns) if _is_count_col(c, count_patterns)}
+        | {i for i in (count_idx or set()) if i < len(columns)}
+    )
     if not count_idx:
         return 0, 0
     keys = {g.lower() for g in group_keys}
-    key_idx = [i for i, c in enumerate(columns) if c.lower() in keys]
+    key_idx = sorted(
+        {i for i, c in enumerate(columns) if c.lower() in keys}
+        | {i for i in (key_idx or set()) if i < len(columns)}
+    )
 
     def blank(row: list) -> int:
         n = 0
@@ -320,6 +335,8 @@ def scrub(
     k: int = 11,
     require_presidio: bool = True,
     max_suppressed_share: float = 0.5,
+    count_idx: set[int] | None = None,
+    key_idx: set[int] | None = None,
 ) -> ScrubReport:
     report = ScrubReport()
 
@@ -333,7 +350,7 @@ def scrub(
         )
 
     report.cells_suppressed, report.rows_suppressed = suppress(
-        columns, rows, k, count_columns, group_keys or set()
+        columns, rows, k, count_columns, group_keys or set(), count_idx, key_idx
     )
 
     # A grouping where most cells fall below k is a row dump wearing a GROUP BY,

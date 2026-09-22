@@ -38,6 +38,9 @@ Rules enforced (all deterministic, no heuristics, no model in the loop):
   R13 see R3
   R14 when the cache carries row/distinct counts, a non-allow group key whose
       distinct count is ≥ half the row count is a person key — denied
+  R15 over non-GREEN, aggregate once, in the outer query: an aggregate inside a
+      scalar subquery, derived table or CTE is a targeted count or a marginal
+      that k-anonymity never sees
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ import sqlglot
 from sqlglot import exp
 
 from . import util
+from .scrub import HARD_DENY
 
 
 def dialect() -> str:
@@ -64,12 +68,19 @@ DIALECT = "databricks"
 # statistic. Over a non-GREEN table they are a row dump wearing GROUP BY.
 _VALUE_AGGS = (
     exp.ArrayAgg, exp.ArrayUniqueAgg, exp.GroupConcat, exp.AnyValue, exp.First, exp.Last,
-    exp.FirstValue, exp.LastValue, exp.ApproxTopK, exp.Mode,
+    exp.FirstValue, exp.LastValue, exp.ApproxTopK, exp.Mode, exp.ArgMax, exp.ArgMin,
 )
 _VALUE_AGG_NAMES = {
     "collect_list", "collect_set", "array_agg", "string_agg", "listagg", "any_value", "first",
-    "last", "first_value", "last_value", "mode", "approx_top_k", "group_concat",
+    "last", "first_value", "last_value", "mode", "approx_top_k", "group_concat", "max_by",
+    "min_by", "arg_max", "arg_min",
 }
+# Order statistics return a member of the input set, so they get the min/max
+# typing rule: fine over a number or a date, one row's value over anything else.
+_ORDER_STATS = (
+    exp.Min, exp.Max, exp.PercentileDisc, exp.PercentileCont, exp.Median, exp.Quantile,
+    exp.ApproxQuantile,
+)
 _NUMERIC_OR_DATE_TYPE = re.compile(
     r"^(?:int|bigint|smallint|tinyint|long|double|float|real|decimal|numeric|date|timestamp)",
     re.IGNORECASE,
@@ -95,7 +106,14 @@ _PATH_READ = re.compile(
 
 # R13: a date-ish column name (Safe Harbor: dates finer than a year are
 # identifiers) may appear only inside one of these truncations.
-_DATEISH = re.compile(r"(?:_date$|_dt$|_ts$|_time$|timestamp|^dod$|death|admit|discharge)")
+_DATEISH = re.compile(
+    r"(?:_date$|_dt$|_ts$|_time$|_at$|timestamp|dttm|datetime|^dos$|^dod$|death|admit|discharge"
+    r"|birth|dob)"
+)
+# Birth dates never get the truncation exemption: month of birth is a Safe
+# Harbor identifier and year-of-birth arithmetic yields an age the gate cannot
+# bound. Use a precomputed, reviewed `*_year` column instead.
+_NEVER_TRUNC = re.compile(r"birth|dob")
 _TRUNC_NODES = (exp.Year, exp.Month, exp.Quarter, exp.TimestampTrunc, exp.DateTrunc)
 _TRUNC_UNITS = {"MONTH", "MON", "MM", "QUARTER", "Q", "YEAR", "YY", "YYYY"}
 # Transparent wrappers sqlglot inserts between a column and its truncation.
@@ -111,6 +129,10 @@ class Verdict:
     # Output column names that are GROUP BY keys, not measures. The scrubber
     # needs these to know which cells to blank when a count falls below k.
     group_keys: set[str] = field(default_factory=set)
+    # The same, by output POSITION: the warehouse names an unaliased `count(1)`
+    # however it likes, and the scrubber must still find it.
+    key_idx: set[int] = field(default_factory=set)
+    count_idx: set[int] = field(default_factory=set)
     # True when every referenced relation is GREEN — relaxes the row ceiling.
     all_green: bool = False
     # Output names whose unaliased expression is a count (count, count_if,
@@ -132,6 +154,8 @@ class Verdict:
             "tables": self.tables,
             "group_keys": sorted(self.group_keys),
             "count_cols": sorted(self.count_cols),
+            "key_idx": sorted(self.key_idx),
+            "count_idx": sorted(self.count_idx),
             "reasons": self.reasons,
             "sql": self.sql,
         }
@@ -383,6 +407,8 @@ def _cached_entries(tables: list[str], index: dict | None) -> list[dict]:
 def _only_truncated(tree: exp.Expression, name: str) -> bool:
     """R13: every reference to column `name` sits inside a month/quarter/year
     truncation (with at most transparent casts in between)."""
+    if _NEVER_TRUNC.search(name):
+        return False
     cols = [c for c in tree.find_all(exp.Column) if c.name.lower() == name]
     if not cols:
         return False
@@ -403,9 +429,12 @@ def _truncation_of(col: exp.Column) -> exp.Expression | None:
 
 
 def _predicate_columns(agg: exp.Expression) -> set[str]:
-    """Columns named in the predicates of any CASE/IF/FILTER inside an aggregate."""
+    """Columns named in a predicate inside an aggregate: CASE/IF/FILTER
+    conditions, and any bare comparison (`sum(cast(sex = 'F' as int))`)."""
     names: set[str] = set()
     for n in agg.walk():
+        if isinstance(n, exp.CountIf):  # a count: k-anonymity suppresses it
+            continue
         preds: list[exp.Expression] = []
         if isinstance(n, exp.Case):
             preds = [i.this for i in n.args.get("ifs", [])]
@@ -413,27 +442,66 @@ def _predicate_columns(agg: exp.Expression) -> set[str]:
             preds = [n.this]
         elif isinstance(n, exp.Filter):
             preds = [n.expression]
+        elif isinstance(n, exp.Predicate) and not _inside(n, exp.CountIf):
+            preds = [n]
         for p in preds:
             names |= {c.name.lower() for c in p.find_all(exp.Column) if c.name}
     return names
 
 
+def _inside(node: exp.Expression, *types) -> bool:
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, types):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _nested_aggregates(tree: exp.Expression) -> list[str]:
+    """R15: aggregates that sit inside a subquery or CTE rather than a terminal select."""
+    out = []
+    for n in tree.find_all(exp.AggFunc):
+        if _in_window(n):
+            continue
+        if _inside(n, exp.Subquery, exp.CTE):
+            out.append(n.sql(dialect=DIALECT)[:60])
+    return out
+
+
 def _small_literal(e: exp.Expression | None, k: int) -> bool:
-    return isinstance(e, exp.Literal) and e.is_int and int(e.name) < k
+    if isinstance(e, exp.Neg):
+        return True
+    if not isinstance(e, exp.Literal) or e.is_string:
+        return False
+    try:
+        return float(e.name) <= k
+    except ValueError:
+        return False
 
 
-def _having_probe(having: exp.Expression, k: int) -> bool:
-    """HAVING count(...) <, <=, = or BETWEEN a literal below k."""
+def _having_probe(having: exp.Expression, k: int, count_cols: set[str]) -> bool:
+    """HAVING <count> <, <=, = or BETWEEN a literal below k, where <count> is a
+    count expression, arithmetic over one, or the alias of a count column."""
+
+    def countish(e: exp.Expression | None) -> bool:
+        if e is None:
+            return False
+        return any(
+            _is_count(n) or (isinstance(n, exp.Column) and n.name.lower() in count_cols)
+            for n in e.walk()
+        )
+
     for n in having.walk():
         if isinstance(n, (exp.LT, exp.LTE, exp.EQ)):
             a, b = n.this, n.expression
-            if (_is_count(a) and _small_literal(b, k)) or (_is_count(b) and _small_literal(a, k)):
+            if (countish(a) and _small_literal(b, k)) or (countish(b) and _small_literal(a, k)):
                 return True
         if isinstance(n, exp.GT | exp.GTE):
             a, b = n.this, n.expression
-            if _small_literal(a, k) and _is_count(b):  # `3 > count(*)`
+            if _small_literal(a, k) and countish(b):  # `3 > count(*)`
                 return True
-        if isinstance(n, exp.Between) and _is_count(n.this):
+        if isinstance(n, exp.Between) and countish(n.this):
             if _small_literal(n.args.get("low"), k):
                 return True
     return False
@@ -503,12 +571,14 @@ def check(
     # Group keys, for the scrubber. By construction of R2 below, any output
     # expression that is not an aggregate must be a GROUP BY key.
     for select in _terminal_selects(tree):
-        for e in select.expressions:
+        for i, e in enumerate(select.expressions):
             inner = e.unalias() if isinstance(e, exp.Alias) else e
             if not _has_aggregate(inner):
                 v.group_keys.add((e.alias_or_name or "").lower())
+                v.key_idx.add(i)
             elif _is_count(inner):
                 v.count_cols.add((e.alias_or_name or "").lower())
+                v.count_idx.add(i)
     v.group_keys.discard("")
     v.count_cols.discard("")
 
@@ -521,7 +591,8 @@ def check(
     denied_desc = [p.lower() for p in pol.get("deny_descriptions", []) or []]
 
     def is_allowed(name: str) -> bool:
-        return any(fnmatch(name, p) for p in allowed_cols)
+        # allow_columns wins, except for names no allowlist may launder.
+        return not HARD_DENY.search(name) and any(fnmatch(name, p) for p in allowed_cols)
 
     referenced = _column_tokens(tree)
     cached = _cached_columns(list(v.tables), index)
@@ -571,6 +642,16 @@ def check(
         selects = _terminal_selects(tree)
         if not selects:
             v.reasons.append("Could not resolve the output projection — denying.")
+
+        # R15 — aggregate once, in the outer query. A count inside a scalar
+        # subquery or a derived table is a targeted count or a marginal that the
+        # scrubber never sees as a count.
+        if nested := _nested_aggregates(tree):
+            v.reasons.append(
+                f"Aggregate inside a subquery/CTE over {listing}: {', '.join(nested[:3])}. "
+                "Nested aggregates are targeted counts or marginals that k-anonymity cannot "
+                "suppress. Aggregate once, in the outer SELECT."
+            )
 
         # R12 — set operations must agree on their grouping, or one branch is
         # the other's marginal.
@@ -633,7 +714,7 @@ def check(
                 if _has_aggregate(inner):
                     # R8 — min/max return one row's value unless the column is
                     # a number or a date.
-                    for mm in inner.find_all(exp.Min, exp.Max):
+                    for mm in inner.find_all(*_ORDER_STATS):
                         arg = mm.this
                         ok = False
                         if isinstance(arg, exp.Column):
@@ -653,7 +734,8 @@ def check(
                                 else "the cache does not type it as numeric/date"
                             )
                             v.reasons.append(
-                                f"`{text}`: min/max over {listing} returns one row's value. "
+                                f"`{text}`: {mm.sql_name().lower()} over {listing} returns one "
+                                "row's value. "
                                 f"Allowed only over a column typed numeric/date ({why}), an "
                                 "allow_columns/count column, or a month/quarter/year truncation."
                             )
@@ -720,7 +802,7 @@ def check(
                             "counts suppressed. Drop the LIMIT or raise it to at least k."
                         )
                 having = select.args.get("having")
-                if having is not None and _having_probe(having, k):
+                if having is not None and _having_probe(having, k, v.count_cols):
                     v.reasons.append(
                         f"HAVING that selects counts below k={k} over {listing} is an "
                         "existence probe: the surviving group keys identify the small cells."

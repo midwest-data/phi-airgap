@@ -98,12 +98,11 @@ allow_columns:
   - "catalog_name"
   - "model_name"
   - "file_name"
-  # Reporting periods: coarser than a day, so not Safe Harbor dates.
+  # Reporting periods: coarser than a day, so not Safe Harbor dates. No
+  # allow pattern can launder a birth/death/age name (`birth_month`, `age_year`
+  # stay denied — see HARD_DENY in scrub.py).
   - "*_year"
   - "*_month"
-  - "*_yr"
-  - "*_mo"
-  - "*period*"
   - "metric_date"
   - "report_date"
   - "as_of_date"
@@ -132,6 +131,33 @@ deny_columns:
   - "*zip*"
   - "*postal*"
   - "*ssn*"
+  # The rest of the Safe Harbor list: geography below state, contact and
+  # account numbers, device/vehicle identifiers, URLs/IPs, biometrics, photos.
+  - "*city*"
+  - "*county*"
+  - "*street*"
+  - "*addr*"
+  - "*fax*"
+  - "*ip_addr*"
+  - "*url*"
+  - "*serial*"
+  - "*license*"
+  - "*plate*"
+  - "*vin"
+  - "*vehicle*"
+  - "mbi"
+  - "*hicn*"
+  - "*beneficiary*"
+  - "*policy_n*"
+  - "*member_n*"
+  - "*account_n*"
+  - "acct*"
+  - "*_acct"
+  - "*biometric*"
+  - "*fingerprint*"
+  - "*photo*"
+  - "*image*"
+  - "*device_id*"
   # Safe Harbor dates and ages. A date column is tolerated by the gate ONLY
   # inside date_trunc('month'|'quarter'|'year', col), year(col) or month(col).
   - "*_date"
@@ -140,6 +166,10 @@ deny_columns:
   - "*_time"
   - "*timestamp*"
   - "dod"
+  - "dos"
+  - "*_at"
+  - "*dttm*"
+  - "*datetime*"
   - "*death*"
   - "admit*"
   - "*_admit*"
@@ -151,7 +181,10 @@ deny_columns:
   # Free text: min/max over it returns one person's record; the description
   # denylist below cannot see an undocumented column.
   - "*diagnos*"
+  - "note"
+  - "*_note"
   - "*notes*"
+  - "*complaint*"
   - "*comment*"
   - "*_text"
   - "*text_*"

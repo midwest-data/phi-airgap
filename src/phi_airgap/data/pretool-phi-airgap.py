@@ -220,7 +220,6 @@ _PY_RUNNER_NAMES = {
 }
 # Every interpreter whose payload is inspected.
 _INTERPRETERS = _PY_RUNNER_NAMES | {"node", "deno", "bun", "ruby", "perl", "php", "Rscript", "R"}
-_SCRIPT_FILE = re.compile(r"[\w./~-]+\.(?:py|js|ts|rb|pl|R|sh|txt)\b")
 
 # Forbidden payload inside anything an interpreter would execute: a warehouse
 # driver, a network client, a credential store, a subprocess escape, or the
@@ -237,7 +236,9 @@ _PY_FORBIDDEN = re.compile(
     r"|phi_airgap\.(?:util|run|adapters|cli)"
     r"|pyodbc|psycopg|snowflake|sqlalchemy|databricks://"
     r"|urllib|requests|http\.client|httpx|aiohttp|socket\b"
-    r"|\bfetch\s*\(|\bnet\.connect|Net::HTTP|net/https?\b|LWP::|curl_init",
+    r"|\bfetch\s*\(|\bnet\.connect|Net::HTTP|net/https?\b|LWP::|curl_init"
+    # The control plane by path: an interpreter can write what the shell writers cannot.
+    r"|\.phi-airgap/|\.claude/|pretool-phi-airgap|settings\.local|\bBYPASS\b",
     re.IGNORECASE,
 )
 
@@ -429,9 +430,10 @@ def _read_local(tok: str) -> str:
     return ""
 
 
-def _script_payload(command: str) -> str:
-    """Concatenate the contents of any local script files named in the command."""
-    return "\n".join(filter(None, (_read_local(t) for t in _SCRIPT_FILE.findall(command))))
+def _script_payload(words: list[str]) -> str:
+    """Contents of every local file named in argument position. Interpreters
+    ignore extensions (`python3 evil.xyz` runs), so the inspector must too."""
+    return "\n".join(filter(None, (_read_local(w) for w in words)))
 
 
 def _warehouse_http(code: str) -> bool:
@@ -538,7 +540,7 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
             )
 
         if exe in _INTERPRETERS or exe.endswith((".py", ".js", ".rb", ".pl")):
-            payload = seg + "\n" + heredocs + "\n" + _script_payload(seg)
+            payload = seg + "\n" + heredocs + "\n" + _script_payload(words)
             if m := _PY_FORBIDDEN.search(payload):
                 return (
                     f"This interpreter invocation reaches live data or a credential "

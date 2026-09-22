@@ -100,8 +100,9 @@ The gate's shape: **`group by` the dimensions you care about, project
 `count(*) as n` plus your aggregates, and read the number.** A row peek is
 denied; an aggregate with a count is allowed. A row whose count is below *k*
 is blanked whole (keys included), dates are allowed only at month/quarter/year
-precision, and `LIMIT`/`HAVING` below *k*, `ROLLUP`, targeted `CASE` inside
-aggregates and mismatched `UNION` branches are denied as existence probes.
+precision, and `LIMIT`/`HAVING` below *k*, `ROLLUP`, targeted predicates
+inside aggregates, aggregates nested in subqueries and mismatched `UNION`
+branches are denied as existence probes. Aggregate once, in the outer SELECT.
 
 ```sql
 -- DENIED: a row peek

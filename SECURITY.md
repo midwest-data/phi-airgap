@@ -115,8 +115,19 @@ we intend to fix by adding a rule:
 - **Differencing across queries.** Two aggregates that differ by one member
   reveal that member. k-anonymity per query does not defend against this;
   review the audit log (`phi-airgap log`, `out/history/`) for query sequences
-  over the same grouping. R10–R12 close the single-query versions (existence
-  probes, ROLLUP marginals, UNION totals), not the multi-query one.
+  over the same grouping. R10–R12 and R15 close the single-query versions
+  (existence probes, ROLLUP marginals, UNION totals, subquery totals and
+  targeted counts), not the multi-query one.
+- **Computed ages and derived dates.** Birth/death columns never get the
+  month/year truncation exemption and no allow pattern can launder a
+  `birth_*`/`age_*` name, but a reviewed precomputed `*_year` column can still
+  yield an age over 89 by subtraction in the reader's head. Bucket ages before
+  they reach the mart.
+- **Interpreter writes to the control plane.** Bash writers on protected paths
+  are denied, and an interpreter payload that names `.phi-airgap/`, `.claude/`,
+  the hook or `BYPASS` is denied; a payload that reaches those paths without
+  naming them (built at runtime) is not. The audit mirror and the policy-hash
+  banner are the detection; the deployment shape is the prevention.
 - **k counts rows, not persons.** A patient with twelve encounters is one
   person and passes k=11 on their own. Aggregate at the grain you mean.
 - **The human must read the verdict.** `phi-airgap run` prints ALLOW/DENY,

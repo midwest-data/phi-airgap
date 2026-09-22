@@ -151,6 +151,51 @@ DENY = [
     "select dept_id, max(diagnosis_text) as dx, count(*) as n from raw.vendor.fact_visit "
     "group by 1",
     "select dept_id, max(los_days) as m, count(*) as n from raw.vendor.fact_visit group by 1",
+    # R15: aggregate once. A scalar subquery is a targeted count; a derived
+    # table's total is a marginal; neither is a count the scrubber can see.
+    "select entity_name, count(*) as n, (select count(*) from raw.vendor.fact_visit t2 "
+    "where t2.entity_name = t.entity_name and t2.dept_id = 'ICU') as f "
+    "from raw.vendor.fact_visit t group by 1",
+    "select t.entity_name, count(*) as n, x.total from raw.vendor.fact_visit t "
+    "join (select count(*) as total from raw.vendor.fact_visit) x group by 1, 3",
+    "with tot as (select dept_id, count(*) as c from raw.vendor.fact_visit group by 1) "
+    "select t.dept_id, count(*) as n, max(tot.c) as c from raw.vendor.fact_visit t "
+    "join tot on t.dept_id = tot.dept_id group by 1",
+    # R9 via a boolean cast instead of CASE.
+    "select entity_name, count(*) as n, sum(cast(dept_id = 'ICU' as int)) as f "
+    "from raw.vendor.fact_visit group by 1",
+    "select entity_name, count(*) as n, avg(cast(dept_id = 'ICU' as int)) as share "
+    "from raw.vendor.fact_visit group by 1",
+    "select entity_name, count(*) as n, sum(los_days * cast(dept_id = 'ICU' as int)) as s "
+    "from raw.vendor.fact_visit group by 1",
+    # R8: max_by / min_by / order statistics return a member of the input.
+    "select entity_name, count(*) as n, max_by(chief_complaint, los_days) as worst "
+    "from raw.vendor.fact_visit group by 1",
+    "select entity_name, count(*) as n, min_by(x, los_days) as x from raw.vendor.fact_visit "
+    "group by 1",
+    "select entity_name, count(*) as n, median(x) as m from raw.vendor.fact_visit group by 1",
+    "select entity_name, count(*) as n, percentile(x, 0.5) as m from raw.vendor.fact_visit "
+    "group by 1",
+    # allow_columns cannot launder birth/death/age names; birth dates never truncate.
+    "select birth_month, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select age_year, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select death_month, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select period_start_date, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select date_trunc('month', birth_date) as m, count(*) as n from raw.vendor.fact_visit "
+    "group by 1",
+    "select year(birth_date) as y, count(*) as n from raw.vendor.fact_visit group by 1",
+    # R10 variants: a float literal, the count's alias, arithmetic over the count.
+    "select dept_id, count(*) as n from raw.vendor.encounter_fact group by 1 "
+    "having count(*) < 10.5",
+    "select dept_id, count(*) as n from raw.vendor.encounter_fact group by 1 having n < 11",
+    "select dept_id, count(*) as n from raw.vendor.encounter_fact group by 1 "
+    "having count(*) + 0 < 11",
+    # More Safe Harbor classes.
+    "select city, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select street_1, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select created_at, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select mbi, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select fax_number, count(*) as n from raw.vendor.fact_visit group by 1",
     # Person keys the old denylist did not name.
     "select external_id, count(*) as n from raw.vendor.fact_visit group by 1",
     "select person_key, count(*) as n from raw.vendor.fact_visit group by 1",
@@ -189,6 +234,9 @@ ALLOW = [
     "select dept_id, count(*) as total_people from raw.vendor.fact_visit group by 1",
     # A conditional count is a count: it gets k-suppressed like any other.
     "select dept_id, count_if(readmitted) as n from raw.vendor.fact_visit group by 1",
+    "select entity_name, count_if(dept_id = 'ICU') as n from raw.vendor.fact_visit group by 1",
+    "select date_trunc('month', created_at) as m, count(*) as n from raw.vendor.fact_visit "
+    "group by 1",
     # Set operations with identical grouping in every branch.
     "select dept_id, count(*) as n from raw.vendor.encounter_fact group by dept_id "
     "union all select dept_id, count(*) as n from analytics.core.encounter_fact group by dept_id",
@@ -255,6 +303,8 @@ def _suppression() -> list[str]:
         fails.append("CHECK_COLUMNS should deny patient_name")
     if scrub.check_columns(["metric_name"], POLICY["deny_columns"], POLICY["allow_columns"]):
         fails.append("CHECK_COLUMNS should allow metric_name")
+    if not scrub.check_columns(["birth_month"], POLICY["deny_columns"], POLICY["allow_columns"]):
+        fails.append("CHECK_COLUMNS should deny birth_month despite the *_month allow pattern")
 
     # `count(*) as total_people` matches no count_columns pattern; the gate's
     # verdict must carry the alias so the scrubber still suppresses on it.
@@ -269,6 +319,19 @@ def _suppression() -> list[str]:
     )
     if rows[1] != [S, S]:
         fails.append(f"SUPPRESS should blank total_people < 11 via verdict.count_cols: {rows}")
+    # An unaliased `count(1)` comes back named whatever the warehouse chose;
+    # the verdict's output position finds it anyway.
+    v = gate.check("select sex, count(1) from raw.vendor.fact_visit group by 1", POLICY)
+    if v.count_idx != {1} or v.key_idx != {0}:
+        fails.append(f"GATE should record count_idx={{1}} key_idx={{0}}, got "
+                     f"{v.count_idx} {v.key_idx}")
+    rows = [["M", 3], ["F", 1], ["X", 520], ["Y", 40], ["Z", 50], ["W", 60]]
+    changed, hit = scrub.suppress(
+        ["sex", "COUNT(1)"], rows, 11, [*POLICY["count_columns"], *v.count_cols],
+        v.group_keys, v.count_idx, v.key_idx,
+    )
+    if hit != 2 or rows[0] != [S, S] or rows[1] != [S, S] or rows[2] != ["X", 520]:
+        fails.append(f"SUPPRESS should find an unaliased count by position: {rows}")
     # Conditional counts are counts too, so they are suppressed rather than
     # passing as measures.
     for sql in (
@@ -573,6 +636,14 @@ HOOK_DENY = [
     "bash <<'EOF'\nsecurity find-generic-password -s phi-airgap-databricks-pat -w\nEOF",
     "python3 q.txt",
     "python3 forbidden.py",
+    "python3 evil.xyz",
+    "python3 evilnoext",
+    "node evilnoext",
+    "python3 /dev/stdin < evil.xyz",
+    # The control plane through an interpreter.
+    'python3 -c "open(\'~/.phi-airgap/BYPASS\', \'w\').close()"',
+    "node -e \"require('fs').writeFileSync(process.env.HOME+'/.claude/settings.local.json','{}')\"",
+    'python3 -c "import os; os.remove(os.path.expanduser(\'~/.phi-airgap/log.jsonl\'))"',
     "node forbidden.js",
     "bash outer.sh",
     # A newline separates commands; the lexer must not swallow it as whitespace.
@@ -687,6 +758,8 @@ _SCRIPTS = {
     "forbidden.py": "import subprocess\nprint(subprocess.run(['ls']))\n",
     "forbidden.js": "const cp = require('child_process');\n",
     "clean.py": "print('hello')\n",
+    "evil.xyz": "import databricks\nprint(1)\n",
+    "evilnoext": "import databricks\nprint(1)\n",
 }
 
 
