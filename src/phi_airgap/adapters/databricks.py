@@ -14,8 +14,13 @@ from . import register
 
 def connect(cfg: dict):
     """Return a DBAPI connection to the configured Databricks SQL warehouse."""
-    from ..util import die, keychain_get
+    from ..util import CONFIG_FILE, die, keychain_get
 
+    if any("<" in str(cfg.get(k, "")) for k in ("host", "http_path")):
+        die(
+            f"host/http_path in {CONFIG_FILE} are still the example placeholders "
+            f"({cfg.get('host')}, {cfg.get('http_path')}). Edit them first."
+        )
     try:
         from databricks import sql as dbsql
     except ImportError:
