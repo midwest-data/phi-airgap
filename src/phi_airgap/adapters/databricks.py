@@ -14,9 +14,16 @@ from . import register
 
 def connect(cfg: dict):
     """Return a DBAPI connection to the configured Databricks SQL warehouse."""
-    from databricks import sql as dbsql
+    from ..util import die, keychain_get
 
-    from ..util import keychain_get
+    try:
+        from databricks import sql as dbsql
+    except ImportError:
+        die(
+            "the Databricks connector is not installed. Reinstall with the extra:\n"
+            "  uv tool install --python 3.12 --reinstall 'phi-airgap[databricks]'   "
+            "(from the repo: '.[databricks]')"
+        )
 
     return dbsql.connect(
         server_hostname=cfg["host"],
