@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Core: the gate + hook + deterministic scrubber. No network, no token, no
+  # heavy deps — installs light and runs fast. `phi-airgap selftest` red-teams the
+  # gate, scrubber and hook (the hook cases subprocess the real hook).
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: phi-airgap selftest
+
+  # NER: adds the Presidio alarm. Heavier (spaCy + en_core_web_lg), so it is a
+  # separate job. `phi-airgap selftest` here additionally exercises the NER path.
+  ner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[ner]'
+      - run: phi-airgap selftest

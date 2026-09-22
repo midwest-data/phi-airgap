@@ -1,0 +1,52 @@
+# phi-airgap runtime config — EXAMPLE. policy.yml holds the security rules; this
+# holds plumbing. Copy it, point PHI_AIRGAP_CONFIG at your copy, and fill in host /
+# http_path. The hook reads a few scalars from here too (see hooks/claude-code/).
+
+# Workspace root that owns the .phi-airgap/ directory. "." = current directory.
+default_root: "."
+
+# Warehouse seam. `adapter` selects a DBAPI adapter from phi_airgap/adapters/;
+# `sql_dialect` is the sqlglot dialect the gate parses in. Only "databricks"
+# ships — add phi-airgap/adapters/<name>.py for another warehouse (~30 lines).
+adapter: databricks
+sql_dialect: databricks
+
+# Placeholders — replace with your workspace host and SQL warehouse http_path.
+host: "<workspace>.cloud.databricks.com"
+http_path: "/sql/1.0/warehouses/<id>"
+
+# Catalogs to pull column metadata from via information_schema on `phi-airgap
+# refresh` (column names are not PHI). Fill in your reviewed list.
+network_catalogs: []
+
+# macOS Keychain service names holding credentials the AGENT MAY NOT read.
+keychain_service: phi-airgap-databricks-pat
+keychain_github_service: phi-airgap-github-pat
+
+# Optional: one Keychain service the agent MAY read directly, for a credential
+# that reaches no sensitive data (e.g. an issue-tracker API key). The hook
+# allows `security ... -s <this>` and nothing else. Empty => all reads denied.
+readable_keychain_service: ""
+
+# dbt run/test/build emit logs, counts and error text — never result rows — so
+# the agent may drive them. Set false for a stricter phi-airgap; `show` and
+# `run-operation` stay blocked either way.
+allow_claude_dbt: true
+
+# Cell suppression threshold. Counts in [1, k) render as "<11".
+k_threshold: 11
+
+# If more than this share of rows fall below k, the whole result is refused:
+# the surviving group keys would themselves be a near-unique list.
+max_suppressed_share: 0.5
+
+# Refuse to emit output if the Presidio alarm cannot run. An alarm that silently
+# does not fire is worse than no alarm. Set false to accept the gate alone (or
+# if you did not install the [ner] extra).
+require_presidio: true
+
+# Row ceilings. Over the ceiling the result is REFUSED, not truncated —
+# truncating a 50,000-row name dump to 200 still emits 200 names.
+# The tight one applies whenever any RED or AMBER relation is read.
+max_rows_sensitive: 200
+max_rows: 5000

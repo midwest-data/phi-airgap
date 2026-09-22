@@ -1,0 +1,41 @@
+[project]
+name = "phi-airgap"
+version = "1.0.0"
+description = "PHI-airgap query broker for LLM coding agents: a deterministic SQL gate, a three-pass scrubber, and an enforcement hook that keep sensitive rows out of the model's context."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+# Pinned: spaCy/Presidio wheels do not resolve on 3.13+. The core (gate + hook)
+# has no such constraint, but the [ner] extra pulls spaCy, so the whole project
+# is pinned for a single supported interpreter.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "sqlglot>=25",
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+# The NER alarm. Heavy (spaCy + a 500MB language model), so it is opt-in.
+ner = [
+    "presidio-analyzer>=2.2",
+    "spacy>=3.7,<3.9",
+    "en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl",
+]
+# The reference warehouse adapter. Swap for your own DBAPI adapter (see
+# src/phi_airgap/adapters/__init__.py) if you are not on Databricks.
+databricks = [
+    "databricks-sql-connector>=4.0",
+]
+
+[project.scripts]
+phi-airgap = "phi_airgap.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# en_core_web_lg ships only as a GitHub release wheel.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phi_airgap"]

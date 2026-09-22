@@ -1,0 +1,188 @@
+# phi-airgap gate policy — THE control. Structural, deterministic, human-reviewed.
+#
+# This is an EXAMPLE tuned for a PHI warehouse. Copy it, point PHI_AIRGAP_POLICY at
+# your copy, and replace the relation globs with your own catalogs/schemas. The
+# column denylist is a generic HIPAA-identifier list and is a reasonable default.
+#
+# Patterns are fnmatch globs, matched case-insensitively against every dotted
+# form of a table reference: catalog.schema.table, schema.table, and table.
+# Per-developer dev-schema mangling is normalised first, so `dev_alice__orders`
+# matches an `orders.*` pattern and an `analytics_dev` catalog matches an
+# `analytics.*` pattern.
+#
+# Most restrictive match wins: red > green > amber (green sits above amber so a
+# reviewed pre-aggregated carve-out inside a mart catalog is not swallowed).
+# NO MATCH => RED. The gate fails closed; an unclassified relation is treated as
+# raw PHI until someone puts it in this file on purpose.
+#
+# Regenerate a review sheet with:  phi-airgap refresh --draft-policy
+# then read policy.draft.yml and promote anything genuinely aggregate to green.
+
+# ── RED — raw sources, staging, and person/encounter-grain marts ─────────────
+# These are row-per-human. Never leaves the warehouse except as an aggregate.
+red:
+  - "raw.*"                       # raw source-system extracts
+  - "*.raw.*"
+  - "staging.*"                   # staging / landing
+  - "*.staging.*"
+  - "*.stg_*"
+  - "*__stg_*"
+  - "*_pii"                       # anything explicitly tagged PII
+  - "*patient*"                   # patient-grain, wherever it lives
+  - "*encounter*"                 # encounter/visit-grain
+  - "*_event"                     # event streams are row-per-event
+  - "*_events"
+
+# ── AMBER — modelled mart finals ────────────────────────────────────────────
+# The modelled layer is mostly identifier-free, but grain is not guaranteed, so
+# AMBER carries the same aggregation requirement as RED. The distinction is for
+# the audit log, not for the rules.
+amber:
+  - "analytics.*"
+  - "analytics_dev.*"
+
+# ── GREEN — pre-aggregated output and metadata ──────────────────────────────
+# Exempt from the aggregation requirement and from the LIMIT rule: these are
+# already one row per entity per metric per period, with no person grain left to
+# leak. Checked BEFORE amber so a carve-out that physically lives inside a mart
+# catalog is not swallowed by the broad `analytics.*` pattern; still loses to red.
+#
+# Deliberately keyed on the `agg_` pre-aggregation prefix rather than a bare
+# `*_month` glob — `*_month` would quietly promote any row-grain daily mart that
+# happens to end in _month.
+green:
+  - "reporting.*"                 # dedicated pre-aggregated reporting catalog
+  - "*.reporting.*"
+  - "agg_*"                       # `agg_` = pre-aggregated, one row per entity/period
+  - "*.agg_*"
+  - "*.metric_targets"            # target values, not observations
+  - "*.targets.*"
+  - "*.information_schema.*"      # column metadata is not PHI
+
+# ── Column denylist — applies ANYWHERE in the statement ─────────────────────
+# SELECT, WHERE, JOIN, ORDER BY, HAVING. Direct identifiers plus the join keys
+# that make a result set re-identifiable. Also enforced post-execution as an
+# independent structural check on the returned column names (hard fail). This is
+# a generic HIPAA Safe-Harbor-shaped list; extend it for your schema.
+#
+# allow_columns is checked FIRST and wins. It exists because `*name*` would
+# otherwise deny `metric_name`, `hospital_name`, `department_name` — the columns
+# an aggregate reporting query needs. Each entry here asserts that the column
+# names an organisation, a metric or a place, never a human. Provider/physician
+# are deliberately NOT allowlisted: they are not patient PHI, but they are person
+# names, so add them per-case and on purpose.
+allow_columns:
+  - "metric_name"
+  - "*metric_name"
+  - "measure_name"
+  - "hospital_name"
+  - "facility_name"
+  - "campus_name"
+  - "entity_name"
+  - "*entity_name"
+  - "department_name"
+  - "dept_name"
+  - "unit_name"
+  - "location_name"
+  - "*location_name"   # names a campus / parent site, never a human
+  - "service_line_name"
+  - "specialty_name"
+  - "service_line"
+  - "sub_service_line"
+  - "org_name"
+  - "payer_name"
+  - "program_name"
+  - "table_name"
+  - "column_name"
+  - "schema_name"
+  - "catalog_name"
+  - "model_name"
+  - "file_name"
+
+deny_columns:
+  - "*name*"
+  - "*dob*"
+  - "*birth*"
+  - "mrn"
+  - "*_mrn"
+  - "mrn_*"
+  - "ssn"
+  - "*address*"
+  - "*phone*"
+  - "*email*"
+  - "*_epic_id"                  # source-system surrogate key that re-identifies
+  - "csn"
+  - "*_csn"
+  - "*_durable_key"              # warehouse durable keys
+  - "*durablekey*"
+  - "patient_id"
+  - "*patient_key*"
+  - "*_nk"                       # natural keys
+  - "*guarantor*"
+  - "*zip*"
+  - "*postal*"
+
+# ── Description denylist — catches identifiers whose NAME is opaque ─────────
+# Matched (fnmatch, lowercased) against the warehouse/model description of every
+# column resolved from the metadata cache. This is what catches `pat_nm`,
+# `ptnt_1` or `nm_lst` — columns the name-based denylist above cannot see but
+# whose documented meaning gives them away. Requires `phi-airgap refresh` to have run.
+deny_descriptions:
+  - "*patient name*"
+  - "*patient's name*"
+  - "*first name*"
+  - "*last name*"
+  - "*middle name*"
+  - "*full name*"
+  - "*legal name*"
+  - "*date of birth*"
+  - "*birth date*"
+  - "*birthdate*"
+  - "*medical record number*"
+  - "*medical record no*"
+  - "*social security*"
+  - "*street address*"
+  - "*mailing address*"
+  - "*home address*"
+  - "*phone number*"
+  - "*telephone*"
+  - "*email address*"
+  - "*contact serial number*"
+  - "*driver*license*"
+  - "*passport*"
+  - "*account number*"
+  - "*health plan*number*"
+
+# ── Count columns — drive k-anonymity suppression ───────────────────────────
+# A row whose count falls below k_threshold (config.yml, default 11) has that
+# cell AND its measure cells replaced with "<11". GROUP BY keys are preserved.
+count_columns:
+  - "n"
+  - "cnt"
+  - "count"
+  - "*_count"
+  - "count_*"
+  - "num_*"
+  - "*_n"
+  - "cases"
+  - "*_cases"
+  - "volume"
+  - "*_volume"
+  - "denominator"
+  - "*_denominator"
+  - "numerator"
+  - "*_numerator"
+  - "observed"
+  - "expected"
+  - "encounters"
+  - "*_encounters"
+  - "discharges"
+  - "*_discharges"
+  - "admissions"
+  - "*_admissions"
+  - "visits"
+  - "*_visits"
+  - "patients"
+  - "*_patients"
+  - "infections"
+  - "*_infections"
