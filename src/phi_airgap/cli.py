@@ -91,7 +91,9 @@ def cmd_refresh(args) -> int:
     from . import meta
 
     manifests = [Path(p).expanduser() for p in args.manifest] or _default_manifests()
-    index = meta.build(manifests, offline=args.offline)
+    if args.stats and args.offline:
+        util.die("--stats needs the warehouse; drop --offline.")
+    index = meta.build(manifests, offline=args.offline, stats=args.stats)
     if not index:
         util.die("Nothing to cache — no manifest found and no catalog reachable.")
     path = meta.save(index)
@@ -102,7 +104,10 @@ def cmd_refresh(args) -> int:
         draft = util.root() / "policy.draft.yml"
         draft.write_text(meta.draft_policy(index, util.policy()))
         print(f"phi-airgap: review sheet -> {draft}")
-    util.audit(event="refresh", relations=len(index), columns=cols, offline=args.offline)
+    util.audit(
+        event="refresh", relations=len(index), columns=cols, offline=args.offline,
+        stats=args.stats,
+    )
     return 0
 
 
@@ -582,6 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--offline", action="store_true", help="dbt manifest only, no warehouse")
     f.add_argument("--manifest", action="append", default=[], help="path to a dbt manifest.json")
     f.add_argument("--draft-policy", action="store_true", help="write policy.draft.yml for review")
+    f.add_argument(
+        "--stats", action="store_true",
+        help="also count rows and distinct values per column (activates gate rule R14; "
+        "one count(*)/count(distinct) statement per relation, can be slow on raw tables)",
+    )
     f.set_defaults(fn=cmd_refresh)
 
     d = sub.add_parser("dbt", help="dbt wrapper: Keychain token, no show/run-operation")

@@ -192,7 +192,19 @@ deny_columns:
   - "*reason*"
   - "*description*"
   # Re-identifying keys. Enumerate EVERY person key in your warehouse here —
-  # grouping by one lists individuals, and k-anonymity only blanks the count.
+  # grouping by one lists individuals, and k-anonymity only blanks the row.
+  # Epic/Caboodle-style names (pat_id, pat_mrn_id, pat_enc_csn_id, csn_id,
+  # patientkey, encounterkey, last_nm, pat_nm, acct_id, har_id) are covered
+  # below; YOUR warehouse has its own — `phi-airgap refresh --stats` then
+  # gate rule R14 flags the ones you missed.
+  - "pat_*"
+  - "*_pat_*"
+  - "*patientkey*"
+  - "*encounterkey*"
+  - "*_nm"
+  - "*_nm_*"
+  - "har_id"
+  - "*_har_id"
   - "*external*id*"
   - "*person*"
   - "*member*id*"

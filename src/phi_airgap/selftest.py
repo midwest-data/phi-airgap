@@ -196,8 +196,16 @@ DENY = [
     "select created_at, count(*) as n from raw.vendor.fact_visit group by 1",
     "select mbi, count(*) as n from raw.vendor.fact_visit group by 1",
     "select fax_number, count(*) as n from raw.vendor.fact_visit group by 1",
-    # Person keys the old denylist did not name.
+    # Person keys the old denylist did not name, incl. Epic/Caboodle-style.
     "select external_id, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select pat_id, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select pat_mrn_id, count(*) as n from raw.vendor.fact_visit group by 1 "
+    "having count(*) >= 11",
+    "select pat_enc_csn_id, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select patientkey, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select encounterkey, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select last_nm, count(*) as n from raw.vendor.fact_visit group by 1",
+    "select har_id, count(*) as n from raw.vendor.fact_visit group by 1",
     "select person_key, count(*) as n from raw.vendor.fact_visit group by 1",
     "select member_id, count(*) as n from raw.vendor.fact_visit group by 1",
 ]
@@ -894,6 +902,31 @@ def _run_end_to_end() -> list[str]:
     return fails
 
 
+def _stats() -> list[str]:
+    """`refresh --stats` fills row_count/distinct_count from one count statement
+    per relation, and R14 then fires on a person key the policy never named."""
+    from . import meta
+
+    fails = []
+    index = {"raw.vendor.fact_visit": {"columns": {
+        "dept_id": {"type": "string"}, "housekey": {"type": "string"}}}}
+    conn = _FakeConn(["c0", "c1", "c2"], [[1000, 12, 990]])
+    if meta.add_stats(conn, index, ["raw.vendor.fact_visit"]) != 1:
+        fails.append("STATS should update one relation")
+    e = index["raw.vendor.fact_visit"]
+    if e.get("row_count") != 1000 or e["columns"]["housekey"].get("distinct_count") != 990:
+        fails.append(f"STATS should record row_count/distinct_count: {e}")
+    v = gate.check("select housekey, count(*) as n from raw.vendor.fact_visit group by 1",
+                   POLICY, index)
+    if v.allowed:
+        fails.append("GATE R14 should DENY a near-unique group key once stats are cached")
+    v = gate.check("select dept_id, count(*) as n from raw.vendor.fact_visit group by 1",
+                   POLICY, index)
+    if not v.allowed:
+        fails.append(f"GATE R14 should ALLOW a low-cardinality key -> {v.reasons}")
+    return fails
+
+
 def _hook_raw(stdin: str, env: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(HOOK)], input=stdin, capture_output=True, text=True, env=env,
@@ -930,6 +963,7 @@ def main() -> int:
     fails += _adopt_roundtrip()
     fails += _ner_smoke()
     fails += _run_end_to_end()
+    fails += _stats()
 
     if HOOK.exists():
         # A scratch HOME: the hook reads ~/.phi-airgap/config.yml (a concrete host

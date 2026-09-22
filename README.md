@@ -82,6 +82,10 @@ the selftest sets). Without either, the CLI falls back to the packaged examples
 The agent's loop, once the hook is registered (see below):
 
 ```bash
+# 0. (human, once) build the cache; --stats adds row/distinct counts so the gate
+#    can flag person keys the policy missed (rule R14).
+phi-airgap refresh --stats
+
 # 1. Column names, types, descriptions — from a local cache, no network.
 phi-airgap schema '*visit*'
 

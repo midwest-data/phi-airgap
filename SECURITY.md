@@ -100,8 +100,11 @@ queries, read credentials, or read raw extracts. A human runs `phi-airgap run`.
   (`policy.yml`): patient/person/member/subscriber/account keys, source-system
   surrogate ids, natural keys. Grouping by one enumerates individuals, and
   k-anonymity only blanks the row — it cannot know a column is a person key.
-  Rule R14 helps only when the metadata cache carries `row_count` /
-  `distinct_count` (see `meta.build`); without them it is inactive.
+  Then run `phi-airgap refresh --stats` (human, warehouse access; one
+  `count(*)`/`count(distinct)` per relation, only counts come back) so the
+  cache carries `row_count` / `distinct_count` and rule R14 flags any group
+  key whose distinct count is at least half the row count — the person keys
+  you missed. Without `--stats` R14 is inactive.
 - Run `phi-airgap refresh` so `min`/`max` can be typed and `*` screened; with
   no cache, `min`/`max` over sensitive data is denied outright.
 - Read every `phi-airgap run` verdict. The human runs the query; the human is
@@ -118,6 +121,12 @@ we intend to fix by adding a rule:
   over the same grouping. R10–R12 and R15 close the single-query versions
   (existence probes, ROLLUP marginals, UNION totals, subquery totals and
   targeted counts), not the multi-query one.
+- **Column names the example denylist does not know.** The shipped
+  `deny_columns` covers generic and Epic/Caboodle-style names (`pat_id`,
+  `pat_mrn_id`, `csn_id`, `patientkey`, `last_nm`, `har_id`, ...). An
+  identifier under a house name it does not match is allowed as a group key
+  and `having count(*) >= 11` then lists it. The denylist is yours to complete;
+  `refresh --stats` + R14 is the safety net for what you miss.
 - **Computed ages and derived dates.** Birth/death columns never get the
   month/year truncation exemption and no allow pattern can launder a
   `birth_*`/`age_*` name, but a reviewed precomputed `*_year` column can still
