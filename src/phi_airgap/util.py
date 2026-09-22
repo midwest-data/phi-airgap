@@ -2,24 +2,38 @@
 
 from __future__ import annotations
 
+import getpass
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+from importlib.resources import files
 from pathlib import Path
 
 import yaml
 
-# When installed editable or run from source, parents[2] is the repo root, where
-# the shipped example configs live.
-# ponytail: config path = PHI_AIRGAP_CONFIG/PHI_AIRGAP_POLICY env override, else the
-# shipped example next to the source. A real deployment points the env vars at a
-# reviewed copy; no walk up the tree.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Packaged examples + the hook, shipped inside the wheel so a `pip install`
+# works without the repo checkout.
+DATA = Path(str(files("phi_airgap") / "data"))
+HOME_DIR = Path.home() / ".phi-airgap"
 
-CONFIG_FILE = Path(os.environ.get("PHI_AIRGAP_CONFIG") or REPO_ROOT / "config.example.yml")
-POLICY_FILE = Path(os.environ.get("PHI_AIRGAP_POLICY") or REPO_ROOT / "policy.example.yml")
+
+def _pick(env: str, name: str) -> Path:
+    """$ENV override, else ~/.phi-airgap/<name>, else the packaged example.
+
+    The hook reads ~/.phi-airgap/config.yml too, so the CLI and the hook now
+    agree on which file is live.
+    """
+    if v := os.environ.get(env):
+        return Path(v).expanduser()
+    home = HOME_DIR / name
+    return home if home.exists() else DATA / f"{name.removesuffix('.yml')}.example.yml"
+
+
+CONFIG_FILE = _pick("PHI_AIRGAP_CONFIG", "config.yml")
+POLICY_FILE = _pick("PHI_AIRGAP_POLICY", "policy.yml")
 
 DEFAULT_CONFIG = {
     "default_root": ".",
@@ -93,7 +107,7 @@ def keychain_get(service: str | None = None) -> str:
     service = service or config()["keychain_service"]
     try:
         r = subprocess.run(
-            ["security", "find-generic-password", "-a", os.environ["USER"], "-s", service, "-w"],
+            ["security", "find-generic-password", "-a", getpass.getuser(), "-s", service, "-w"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -112,7 +126,7 @@ def keychain_has(service: str) -> bool:
     try:
         return (
             subprocess.run(
-                ["security", "find-generic-password", "-a", os.environ["USER"], "-s", service],
+                ["security", "find-generic-password", "-a", getpass.getuser(), "-s", service],
                 capture_output=True,
                 timeout=15,
             ).returncode
@@ -129,6 +143,29 @@ def audit(**fields) -> None:
     line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **fields}
     with (phi_airgap_dir() / "log.jsonl").open("a") as fh:
         fh.write(json.dumps(line, default=str) + "\n")
+
+
+def control_hashes() -> dict[str, str]:
+    """sha256 of the policy and config files — the ACL the gate enforces."""
+    out = {}
+    for name, path in (("policy_sha256", POLICY_FILE), ("config_sha256", CONFIG_FILE)):
+        out[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
+    return out
+
+
+def last_audit(event: str) -> dict | None:
+    """The most recent audit entry for `event`, from the tail of log.jsonl."""
+    path = phi_airgap_dir() / "log.jsonl"
+    if not path.exists():
+        return None
+    for line in reversed(path.read_text().splitlines()[-500:]):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("event") == event:
+            return e
+    return None
 
 
 def die(msg: str, code: int = 2) -> None:

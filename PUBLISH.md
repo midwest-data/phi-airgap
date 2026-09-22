@@ -29,8 +29,14 @@ because it *contains* the scan pattern — that is the search list, not a leak.)
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e '.[ner,databricks]'
-.venv/bin/phi-airgap selftest        # expect: N/N cases pass — AIRGAP OK
+.venv/bin/phi-airgap selftest        # expect: N/N cases pass — PHI-AIRGAP OK
+ruff check src tests
 ```
+
+> This file carries the org/vendor proper-noun scan list and is already in git
+> history. Before the repo goes public: delete it, keep the pattern in an
+> untracked `.publish-scan.local`, and either squash to a fresh root commit or
+> accept that history contains the list.
 
 ## 3. Verify the name is available before you commit to it
 
@@ -68,5 +74,7 @@ gh repo edit --visibility public
 
 - Snowflake / BigQuery / Postgres adapters (the seam is documented in
   `src/phi_airgap/adapters/__init__.py`; add on demand).
-- Publishing to PyPI / a Homebrew formula.
+- Publishing to PyPI / a Homebrew formula. Note PyPI rejects the
+  `en_core_web_lg @ https://…` direct reference in `pyproject.toml`; switch the
+  `[ner]` extra to `python -m spacy download en_core_web_lg` at that point.
 - Porting the hook to non-Claude-Code harnesses.

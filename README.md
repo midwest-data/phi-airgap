@@ -49,14 +49,18 @@ gate and hook have no such constraint, but the project is pinned to one
 supported interpreter for simplicity. If you only need the gate and hook, you
 still need 3.12 to install from this pyproject.
 
-Point `phi-airgap` at your reviewed config and policy (copy the examples):
+Then seed the config, policy and the Claude Code hook in one step, and edit
+the two YAML files (they are the ACL):
 
 ```bash
-cp config.example.yml   ~/.phi-airgap/config.yml   # edit host, http_path, catalogs
-cp policy.example.yml   ~/.phi-airgap/policy.yml   # edit the RED/AMBER/GREEN globs
-export PHI_AIRGAP_CONFIG=~/.phi-airgap/config.yml
-export PHI_AIRGAP_POLICY=~/.phi-airgap/policy.yml
+phi-airgap init          # ~/.phi-airgap/{config,policy}.yml + ~/.claude/hooks/ + settings.json
+$EDITOR ~/.phi-airgap/config.yml ~/.phi-airgap/policy.yml
+phi-airgap doctor        # hook installed, current, and actually denying
 ```
+
+`PHI_AIRGAP_CONFIG` / `PHI_AIRGAP_POLICY` override the `~/.phi-airgap/` paths.
+Without either, the CLI falls back to the packaged examples (and `doctor`
+complains, because an example policy is not a reviewed one).
 
 ---
 

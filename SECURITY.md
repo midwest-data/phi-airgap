@@ -46,6 +46,36 @@ queries, read credentials, or read raw extracts. A human runs `phi-airgap run`.
   protection — `phi-airgap doctor` checks that it is installed and registered.
 - **`PHI_AIRGAP_BYPASS=1`** disables the hook entirely. It exists for the human to
   use deliberately; if it is set in the agent's environment, there is no hook.
+- **The control plane.** The policy is the ACL. The hook denies Bash writers
+  (`sed -i`, `tee`, `cp`, `mv`, `rm`, `>`, `truncate`, `chmod`, editors) and the
+  Write/Edit tools on the policy/config files, the hook itself and
+  `~/.claude/settings.json`. As a belt independent of the hook, `phi-airgap run`
+  records `sha256(policy)` and `sha256(config)` in every audit line and prints a
+  `*** POLICY CHANGED since last run ***` banner when either differs from the
+  previous query. A write routed through an interpreter
+  (`python3 -c "open(...)"`) is not caught; the banner is what catches it.
+
+## Known residuals
+
+Shapes the layers do not close. Each is a policy or review decision, not a bug
+we intend to fix by adding a rule:
+
+- **`min`/`max` over strings.** `max(free_text_column)` over a group is one row's
+  value. `min`/`max` stay allowed because they are legitimate on timestamps;
+  put free-text and identifier columns in `deny_columns` / `deny_descriptions`.
+  (`collect_list`, `any_value`, `first`, `last`, `mode`, `array_agg`,
+  `string_agg` and friends *are* denied — rule R8.)
+- **Differencing across queries.** Two aggregates that differ by one member
+  reveal that member. k-anonymity per query does not defend against this;
+  review the audit log for query sequences over the same grouping.
+- **dbt models and macros.** `phi-airgap dbt run` scrubs stdout, but a model or
+  macro can `log(run_query(...))` rows into that stdout, and only the scrubber
+  (regex floor + NER alarm) stands in the way. Review macros like SQL.
+- **Local extracts.** `.parquet` and `.duckdb` reads are denied; `.csv` /
+  `.xlsx` files are not, because the scrubbed output is itself a `.csv`. Do not
+  leave raw extracts in the workspace.
+- **Interpreter writes to the control plane** — see above; the policy-hash
+  banner is the detection, not a prevention.
 
 **Out of scope:** phi-airgap does not defend against a malicious operator, a
 compromised warehouse, side channels in aggregate statistics beyond the k-anon

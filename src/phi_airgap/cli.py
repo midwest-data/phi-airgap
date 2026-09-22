@@ -8,6 +8,7 @@ output. Patient/row-grain data never reaches the model.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -22,8 +23,12 @@ BANNER = "phi-airgap — PHI-airgap query broker. Reduces disclosure risk; not H
 # dbt subcommands that print result rows. Blocked regardless of allow_claude_dbt.
 DBT_BLOCKED = {"show", "run-operation"}
 
-# Where the enforcement hook is expected once installed.
+# Where the enforcement hook is expected once installed, and where it ships from.
 HOOK_INSTALL_PATH = Path.home() / ".claude/hooks/pretool-phi-airgap.py"
+HOOK_PACKAGED = util.DATA / "pretool-phi-airgap.py"
+SETTINGS = Path.home() / ".claude/settings.json"
+HOOK_MATCHER = "Bash|Read|Write|Edit|MultiEdit|Grep"
+HOOK_ENTRY = {"type": "command", "command": f"python3 {HOOK_INSTALL_PATH}"}
 
 
 # --- subcommands -------------------------------------------------------------
@@ -187,15 +192,30 @@ def cmd_doctor(args) -> int:
     )
 
     print("\nharness hook")
-    check(HOOK_INSTALL_PATH.exists(), f"{HOOK_INSTALL_PATH} exists")
-    settings = Path.home() / ".claude/settings.json"
+    check(HOOK_INSTALL_PATH.exists(), f"{HOOK_INSTALL_PATH} exists", "phi-airgap init")
+    if HOOK_INSTALL_PATH.exists():
+        installed, packaged = _hook_version(HOOK_INSTALL_PATH), _hook_version(HOOK_PACKAGED)
+        check(
+            HOOK_INSTALL_PATH.read_bytes() == HOOK_PACKAGED.read_bytes(),
+            f"installed hook matches packaged (installed {installed}, packaged {packaged})",
+            "phi-airgap init --force-hook",
+        )
+        check(
+            _hook_denies(HOOK_INSTALL_PATH, "phi-airgap run x.sql"),
+            "installed hook denies `phi-airgap run` when actually invoked",
+        )
     registered = False
-    if settings.exists():
-        registered = "pretool-phi-airgap.py" in settings.read_text()
-    check(registered, "hook registered in ~/.claude/settings.json")
+    if SETTINGS.exists():
+        registered = "pretool-phi-airgap.py" in SETTINGS.read_text()
+    check(registered, f"hook registered in {SETTINGS}", "phi-airgap init")
 
     print("\npolicy + cache")
-    check(util.POLICY_FILE.exists(), f"{util.POLICY_FILE} exists")
+    check(util.POLICY_FILE.exists(), f"policy: {util.POLICY_FILE}")
+    check(
+        util.POLICY_FILE.parent != util.DATA,
+        "policy is a reviewed copy, not the packaged example",
+        "phi-airgap init, then edit ~/.phi-airgap/policy.yml",
+    )
     from . import meta
 
     cache = meta.cache_path()
@@ -220,8 +240,28 @@ def cmd_doctor(args) -> int:
     return 1 if problems else 0
 
 
+def _hook_version(path: Path) -> str:
+    m = re.search(r"^# hook-version:\s*(\S+)", path.read_text(errors="replace"), re.M)
+    return m.group(1) if m else "unknown"
+
+
+def _hook_denies(hook: Path, command: str) -> bool:
+    """Run the installed hook on one Bash payload; True if it printed a deny."""
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    try:
+        r = subprocess.run(
+            [sys.executable, str(hook)], input=payload, capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return '"deny"' in r.stdout
+
+
 _SECRET_SCAN = re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}")
-_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "target", "__pycache__", ".phi-airgap", "dbt_packages"}
+_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "target", "__pycache__", ".phi-airgap",
+    "dbt_packages",
+}
 
 
 def _scan_secrets(base: Path, limit: int = 40) -> list[tuple[str, str]]:
@@ -249,7 +289,8 @@ _POINTER = (
     "# {key} removed by `phi-airgap adopt` on the PHI phi-airgap.\n"
     "# The value now lives in the macOS Keychain under service `{service}`,\n"
     "# where the agent cannot read it. Run commands through `phi-airgap` (which injects it),\n"
-    "# or in a shell:  export {key}=$(security find-generic-password -a \"$USER\" -s {service} -w)\n"
+    "# or in a shell:\n"
+    "#   export {key}=$(security find-generic-password -a \"$USER\" -s {service} -w)\n"
 )
 
 
@@ -274,7 +315,7 @@ def cmd_adopt(args) -> int:
     secret = m.group(1)
 
     r = subprocess.run(
-        ["security", "add-generic-password", "-U", "-a", os.environ["USER"], "-s", service,
+        ["security", "add-generic-password", "-U", "-a", getpass.getuser(), "-s", service,
          "-w", secret, "-D", "phi-airgap PHI broker", "-j", f"adopted from {path}"],
         capture_output=True, text=True,
     )
@@ -292,7 +333,8 @@ def cmd_adopt(args) -> int:
     print(
         f"phi-airgap: {args.key} -> Keychain service '{service}' (verified)\n"
         f"phi-airgap: {path} rewritten with a pointer comment\n"
-        f"phi-airgap: plaintext backup at {backup} — DELETE IT once you have confirmed things work:\n"
+        f"phi-airgap: plaintext backup at {backup} — DELETE IT once you have confirmed things "
+        "work:\n"
         f"      rm '{backup}'\n"
         f"phi-airgap: this token has appeared in shell history and past transcripts. ROTATE IT."
     )
@@ -303,11 +345,53 @@ def cmd_adopt(args) -> int:
 def cmd_selftest(args) -> int:
     """Run the red-team suite. Exposed as a subcommand so it is runnable without
     naming a .py file that the harness hook (rightly) refuses to execute."""
-    tests_dir = util.REPO_ROOT / "tests"
-    sys.path.insert(0, str(tests_dir))
-    import test_airgap
+    from . import selftest
 
-    return test_airgap.main()
+    return selftest.main()
+
+
+def cmd_init(args) -> int:
+    """Copy the example config/policy to ~/.phi-airgap/ (never overwriting),
+    install the hook, and register it in ~/.claude/settings.json."""
+    import shutil
+
+    util.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    for name in ("config", "policy"):
+        dst = util.HOME_DIR / f"{name}.yml"
+        if dst.exists():
+            print(f"phi-airgap: kept existing {dst}")
+        else:
+            shutil.copy(util.DATA / f"{name}.example.yml", dst)
+            print(f"phi-airgap: wrote {dst} — EDIT IT before use")
+
+    HOOK_INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if HOOK_INSTALL_PATH.exists() and not args.force_hook:
+        if HOOK_INSTALL_PATH.read_bytes() != HOOK_PACKAGED.read_bytes():
+            print(
+                f"phi-airgap: {HOOK_INSTALL_PATH} differs from packaged — rerun with --force-hook"
+            )
+    else:
+        shutil.copy(HOOK_PACKAGED, HOOK_INSTALL_PATH)
+        HOOK_INSTALL_PATH.chmod(0o755)
+        print(f"phi-airgap: installed hook -> {HOOK_INSTALL_PATH}")
+
+    data = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    blocks = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    ours = [
+        b for b in blocks
+        if any("pretool-phi-airgap" in h.get("command", "") for h in b.get("hooks", []))
+    ]
+    if ours and ours[0].get("matcher") == HOOK_MATCHER:
+        print(f"phi-airgap: hook already registered in {SETTINGS}")
+    else:
+        for b in ours:
+            blocks.remove(b)
+        blocks.append({"matcher": HOOK_MATCHER, "hooks": [HOOK_ENTRY]})
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"phi-airgap: registered hook in {SETTINGS} (matcher {HOOK_MATCHER})")
+    util.audit(event="init")
+    return 0
 
 
 def cmd_log(args) -> int:
@@ -338,7 +422,9 @@ def cmd_uninstall(args) -> int:
         blocks = data.get("hooks", {}).get("PreToolUse", [])
         for block in blocks:
             block["hooks"] = [
-                h for h in block.get("hooks", []) if "pretool-phi-airgap" not in h.get("command", "")
+                h
+                for h in block.get("hooks", [])
+                if "pretool-phi-airgap" not in h.get("command", "")
             ]
         data["hooks"]["PreToolUse"] = [b for b in blocks if b.get("hooks")]
         settings.write_text(json.dumps(data, indent=2))
@@ -414,6 +500,12 @@ def main(argv: list[str] | None = None) -> int:
         help="report only, exit 1 if anything would be redacted (no output, no rewrite)",
     )
     c.set_defaults(fn=cmd_scrub)
+
+    i = sub.add_parser(
+        "init", help="copy example config/policy to ~/.phi-airgap and install the hook"
+    )
+    i.add_argument("--force-hook", action="store_true", help="overwrite an existing installed hook")
+    i.set_defaults(fn=cmd_init)
 
     sub.add_parser("doctor", help="verify the phi-airgap is intact").set_defaults(fn=cmd_doctor)
     sub.add_parser("selftest", help="red-team the gate, scrubber and hook").set_defaults(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# hook-version: 1.0.0
+# hook-version: 1.1.0
 """
-PreToolUse:Bash|Read Hook: PHI Airgap enforcement (Claude Code).
+PreToolUse:Bash|Read|Write|Edit|MultiEdit|Grep Hook: PHI Airgap enforcement (Claude Code).
 
 Blocks the execution and read paths that could put live row-grain data into an
 LLM agent's context. Instructions in CLAUDE.md are the belt; this hook is the
@@ -10,7 +10,9 @@ braces — it denies the tool call regardless of what the prose says.
 This is a HARD GATE — it prints a JSON permissionDecision:deny to block, and
 otherwise exits 0 to allow.
 
-Every decision is made per execution segment, on the token in COMMAND position.
+Every decision is made per execution segment, on the token in COMMAND position,
+after leading wrappers (env, nice, timeout, sudo, uv run, poetry run, xargs, ...)
+are stripped and `bash -c "<str>"` / `python -m phi_airgap` are unwrapped.
 A command that merely mentions `.env` in a commit message or a heredoc body is
 not executing it, and denying that made the hook unusable for writing about the
 phi-airgap itself.
@@ -26,9 +28,15 @@ Denied on Bash:
 - phi-airgap run / uninstall / adopt, and `phi-airgap refresh` without --offline
 - reading a .env / .envrc / .env.<suffix> with a reader command, and redirecting
   into any of them (.env.example / .env.template / .env.sample stay readable)
+- writing to the control plane: the policy/config files, this hook, and
+  ~/.claude/settings.json (sed -i, tee, cp, mv, rm, >, >>, truncate, chmod, editors).
+  The policy is the ACL; the human edits it.
 
-Denied on Read:
+Denied on Read / Grep (path):
 - *.parquet, *.duckdb, .phi-airgap/out/*.raw.*, **/.envrc, **/.env(.local|...)
+
+Denied on Write / Edit / MultiEdit (file_path):
+- everything in the Read list, plus the control-plane files above
 
 Allow-through:
 - everything else, including `phi-airgap schema`, `phi-airgap scrub`, `phi-airgap log`,
@@ -75,7 +83,7 @@ def _config_value(key: str, fallback: str) -> str:
     try:
         m = re.search(rf"^{re.escape(key)}:\s*(.+?)\s*$", _CONFIG.read_text(), re.M)
         if m:
-            return m.group(1).strip().strip("'\"")
+            return re.sub(r"\s+#.*$", "", m.group(1)).strip().strip("'\"")
     except OSError:
         pass
     return fallback
@@ -87,6 +95,67 @@ def _readable_service() -> str:
 
 def _warehouse_host() -> str:
     return _config_value("host", "")
+
+
+# --- the control plane --------------------------------------------------------
+# The policy is the ACL the gate enforces; the hook and settings.json are what
+# make it bite. The agent may read them, never rewrite them.
+
+_PROTECTED_SUFFIXES = (
+    "/.phi-airgap/policy.yml",
+    "/.phi-airgap/config.yml",
+    "/.claude/hooks/pretool-phi-airgap.py",
+    "/.claude/settings.json",
+)
+
+
+def _protected_files() -> set[str]:
+    home = Path.home()
+    files = {
+        _CONFIG,
+        Path(os.environ.get("PHI_AIRGAP_POLICY") or home / ".phi-airgap" / "policy.yml"),
+        home / ".claude" / "hooks" / "pretool-phi-airgap.py",
+        home / ".claude" / "settings.json",
+        *(home / ".phi-airgap").glob("*.yml"),
+    }
+    return {str(Path(f).expanduser().resolve()) for f in files}
+
+
+def _is_protected(token: str) -> bool:
+    tok = token.strip("'\"")
+    if not tok or "/" not in tok and "." not in tok:
+        return False
+    try:
+        resolved = str(Path(os.path.expanduser(tok)).resolve())
+    except (OSError, RuntimeError):
+        resolved = tok
+    return resolved in _protected_files() or resolved.endswith(_PROTECTED_SUFFIXES)
+
+
+_PROTECTED_REASON = (
+    "The policy is the ACL; the human edits it. Writing to the phi-airgap policy/config, "
+    "the enforcement hook or ~/.claude/settings.json is blocked. Ask the user to make the "
+    "change."
+)
+
+# Command-position executables that overwrite or delete their path arguments.
+_WRITERS = {
+    "tee", "cp", "mv", "rm", "truncate", "chmod", "chown", "install", "ln", "dd", "rsync",
+    "vim", "vi", "nano", "emacs", "code", "open", "shred", "unlink", "touch",
+}
+
+
+def _writes_protected(words: list[str]) -> bool:
+    exe = _basename(words[0])
+    in_place = exe in {"sed", "perl"} and any(
+        w == "--in-place" or re.match(r"^-[a-zA-Z]*i", w) for w in words[1:]
+    )
+    if (exe in _WRITERS or in_place) and any(_is_protected(w) for w in words[1:]):
+        return True
+    return any(
+        w in (">", ">>") and i + 1 < len(words) and _is_protected(words[i + 1])
+        for i, w in enumerate(words)
+    )
 
 
 # --- Bash patterns -----------------------------------------------------------
@@ -216,16 +285,62 @@ def _segments(command: str) -> list[list[str]]:
     return segments
 
 
-_SKIP_TOKENS = {"sudo", "command", "exec", "time", "nohup", "then", "do", "else", "!", "{", "("}
+_SKIP_TOKENS = {
+    "sudo", "command", "exec", "time", "nohup", "nice", "xargs", "uvx", "then", "do", "else",
+    "!", "{", "(",
+}
+# `<tool> run <cmd>` wrappers: the real command sits after `run` and its flags.
+_RUN_WRAPPERS = {"uv", "poetry", "pipenv", "pdm"}
+# Wrapper flags that take a separate value, so the value is not mistaken for the command.
+_VALUE_FLAGS = {
+    "-u", "--unset", "-n", "--adjust", "-s", "--signal", "-k", "--kill-after", "--with",
+    "--with-requirements", "--with-editable", "-p", "--python", "--extra", "--group",
+    "--directory", "--project", "--env-file", "--index", "--package", "--from", "-C", "-P",
+}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+
+
+def _strip_flags(out: list[str]) -> None:
+    while out and out[0].startswith("-"):
+        flag = out.pop(0)
+        if flag in _VALUE_FLAGS and out:
+            out.pop(0)
 
 
 def _words(tokens: list[str]) -> list[str]:
-    """Segment tokens with leading env assignments and wrapper words removed."""
-    out: list[str] = []
-    for tok in tokens:
-        if not out and (tok in _SKIP_TOKENS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok)):
-            continue
-        out.append(tok)
+    """Segment tokens with leading env assignments and wrappers removed.
+
+    Wrappers are peeled in a loop so `env timeout 30 uv run python3 -c ...`
+    lands on `python3` — the token that decides. Per-pattern patches for each
+    wrapper were how `uv run phi-airgap run` slipped through.
+    """
+    out = list(tokens)
+    while out:
+        tok = out[0]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            out.pop(0)
+        elif tok in _SKIP_TOKENS or tok == "env":
+            out.pop(0)
+            _strip_flags(out)
+        elif tok == "timeout":
+            out.pop(0)
+            _strip_flags(out)
+            if out:
+                out.pop(0)  # the duration
+        elif tok in _RUN_WRAPPERS and len(out) > 1 and out[1] == "run":
+            del out[:2]
+            _strip_flags(out)
+        else:
+            break
+    # `python -m phi_airgap[.cli] ...` / `-m dbt ...` are the CLIs by another name.
+    if out and _basename(out[0]) in _PY_RUNNER_NAMES and "-m" in out[1:4]:
+        i = out.index("-m")
+        if i + 1 < len(out):
+            module = out[i + 1].split(".")[0]
+            if module == "phi_airgap":
+                out = ["phi-airgap", *out[i + 2 :]]
+            elif module == "dbt":
+                out = ["dbt", *out[i + 2 :]]
     return out
 
 
@@ -293,6 +408,15 @@ def _check_bash(command: str) -> str | None:
                 + _PROTOCOL
             )
 
+        # `bash -c "<script>"`: the script is shell code, judge it as such.
+        if exe in _SHELLS:
+            i = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-\w*c\w*$", w)), None)
+            if i is not None and i + 1 < len(words) and (r := _check_bash(words[i + 1])):
+                return r
+
+        if _writes_protected(words):
+            return _PROTECTED_REASON + " " + _PROTOCOL
+
         if exe == "security" and _KEYCHAIN_READ.search(seg):
             # The one exception is the service named by config
             # `readable_keychain_service`, for a credential that reaches no
@@ -333,7 +457,7 @@ def _check_bash(command: str) -> str | None:
                 "are readable. `phi-airgap doctor` checks credential hygiene. " + _PROTOCOL
             )
 
-        if exe in _PY_RUNNER_NAMES:
+        if exe in _PY_RUNNER_NAMES or exe.endswith(".py"):
             payload = seg + "\n" + heredocs + "\n" + _script_payload(seg)
             if m := _PY_FORBIDDEN.search(payload):
                 return (
@@ -371,6 +495,12 @@ def _check_read(path: str) -> str | None:
     return None
 
 
+def _check_write(path: str) -> str | None:
+    if _is_protected(path):
+        return f"{_PROTECTED_REASON} {_PROTOCOL}"
+    return _check_read(path)
+
+
 def _deny(reason: str) -> None:
     print(f"[phi-airgap] BLOCKED: {reason}", file=sys.stderr)
     print(
@@ -406,8 +536,10 @@ def main() -> None:
     tool = event.get("tool_name", "")
     tool_input = event.get("tool_input", {}) or {}
 
-    if tool == "Read":
-        reason = _check_read(str(tool_input.get("file_path", "")))
+    if tool in ("Read", "Grep"):
+        reason = _check_read(str(tool_input.get("file_path") or tool_input.get("path") or ""))
+    elif tool in ("Write", "Edit", "MultiEdit"):
+        reason = _check_write(str(tool_input.get("file_path", "")))
     else:
         command = tool_input.get("command", "")
         reason = _check_bash(command) if command else None

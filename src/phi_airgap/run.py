@@ -60,6 +60,18 @@ def run_file(path: Path) -> int:
     except Exception:
         pass
 
+    # Belt for a rewritten ACL, independent of the hook: shout if the policy or
+    # config changed since the last query, so a silent edit cannot go unnoticed.
+    hashes = util.control_hashes()
+    last = util.last_audit("query") or {}
+    for key in ("policy_sha256", "config_sha256"):
+        if last.get(key) and last[key] != hashes[key]:
+            print(
+                f"\n*** {key.split('_')[0].upper()} CHANGED since last run ***\n"
+                f"    was {last[key]}\n    now {hashes[key]}\n",
+                file=sys.stderr,
+            )
+
     verdict = gate.check(sql, pol, index)
     doc = verdict.to_dict()
     doc["source"] = str(path)
@@ -68,13 +80,14 @@ def run_file(path: Path) -> int:
     if not verdict.allowed:
         _write_outputs(stem, doc)
         util.audit(
-            event="query", source=str(path), verdict="DENY",
+            event="query", source=str(path), verdict="DENY", **hashes,
             classification=verdict.worst, reasons=verdict.reasons,
         )
         print(f"DENY  [{verdict.worst}]  {path}", file=sys.stderr)
         for r in verdict.reasons:
             print(f"  - {r}", file=sys.stderr)
-        print(f"\nVerdict written to {util.phi_airgap_dir() / 'out' / (stem + '.json')}", file=sys.stderr)
+        print(f"\nVerdict written to {util.phi_airgap_dir() / 'out' / (stem + '.json')}",
+              file=sys.stderr)
         return 1
 
     print(f"ALLOW [{verdict.worst}]  {', '.join(verdict.tables) or 'no tables'}")
@@ -89,7 +102,7 @@ def run_file(path: Path) -> int:
     except Exception as e:
         doc["error"] = f"{type(e).__name__}: {e}"
         _write_outputs(stem, doc)
-        util.audit(event="query", source=str(path), verdict="ERROR", error=doc["error"])
+        util.audit(event="query", source=str(path), verdict="ERROR", error=doc["error"], **hashes)
         print(f"phi-airgap: query failed: {doc['error']}", file=sys.stderr)
         return 3
 
@@ -101,7 +114,7 @@ def run_file(path: Path) -> int:
             "raise max_rows_sensitive in config.yml on purpose."
         )
         _write_outputs(stem, doc)
-        util.audit(event="query", source=str(path), verdict="ROW_CEILING", rows=len(rows))
+        util.audit(event="query", source=str(path), verdict="ROW_CEILING", rows=len(rows), **hashes)
         print(f"phi-airgap: {doc['error']}", file=sys.stderr)
         return 5
 
@@ -110,7 +123,7 @@ def run_file(path: Path) -> int:
             columns,
             rows,
             deny_columns=pol.get("deny_columns", []),
-            count_columns=pol.get("count_columns", []),
+            count_columns=[*(pol.get("count_columns", []) or []), *verdict.count_cols],
             allow_columns=pol.get("allow_columns", []),
             group_keys=verdict.group_keys,
             k=cfg["k_threshold"],
@@ -120,7 +133,7 @@ def run_file(path: Path) -> int:
     except scrub.ScrubFail as e:
         doc["scrub_failed"] = str(e)
         _write_outputs(stem, doc)  # verdict only — the result set is discarded
-        util.audit(event="query", source=str(path), verdict="SCRUB_FAIL", error=str(e))
+        util.audit(event="query", source=str(path), verdict="SCRUB_FAIL", error=str(e), **hashes)
         print(f"phi-airgap: SCRUB FAILED — no output written.\n  {e}", file=sys.stderr)
         return 4
 
@@ -131,7 +144,7 @@ def run_file(path: Path) -> int:
     util.audit(
         event="query", source=str(path), verdict="ALLOW", classification=verdict.worst,
         tables=verdict.tables, rows=len(rows),
-        cells_suppressed=report.cells_suppressed, alarm=report.alarm,
+        cells_suppressed=report.cells_suppressed, alarm=report.alarm, **hashes,
     )
 
     if report.alarm:

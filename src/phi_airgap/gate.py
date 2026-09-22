@@ -20,6 +20,8 @@ Rules enforced (all deterministic, no heuristics, no model in the loop):
       k-anonymity suppression has something to act on
   R7  no LIMIT/OFFSET on a non-aggregated projection — the "peek at 10 rows"
       habit, and paged repetition of it
+  R8  no value-preserving "aggregates" over a non-GREEN table (collect_list,
+      any_value, first, ...) — they return row values, not a statistic
 """
 
 from __future__ import annotations
@@ -33,9 +35,27 @@ from sqlglot import exp
 
 from . import util
 
-# One-value swap: the sqlglot dialect the gate parses and re-serialises in.
-# Read once at import; restart to change it.
-DIALECT = util.config().get("sql_dialect", "databricks")
+
+def dialect() -> str:
+    """The sqlglot dialect the gate parses and re-serialises in (config)."""
+    return util.config().get("sql_dialect", "databricks")
+
+
+# Set per check() call so tests and the selftest do not depend on import order.
+DIALECT = "databricks"
+
+# R8: aggregate functions that return one or more INPUT VALUES rather than a
+# statistic. Over a non-GREEN table they are a row dump wearing GROUP BY.
+# min/max are deliberately not here (legitimate on timestamps); `max(free_text)`
+# is a documented residual that belongs in deny_columns/deny_descriptions.
+_VALUE_AGGS = (
+    exp.ArrayAgg, exp.ArrayUniqueAgg, exp.GroupConcat, exp.AnyValue, exp.First, exp.Last,
+    exp.FirstValue, exp.LastValue, exp.ApproxTopK, exp.Mode,
+)
+_VALUE_AGG_NAMES = {
+    "collect_list", "collect_set", "array_agg", "string_agg", "listagg", "any_value", "first",
+    "last", "first_value", "last_value", "mode", "approx_top_k", "group_concat",
+}
 
 # Only read statements ever reach the warehouse through the broker.
 _ALLOWED_ROOT = (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.Describe, exp.Show)
@@ -67,6 +87,9 @@ class Verdict:
     group_keys: set[str] = field(default_factory=set)
     # True when every referenced relation is GREEN — relaxes the row ceiling.
     all_green: bool = False
+    # Output names whose unaliased expression is exactly `count(...)`. The
+    # scrubber suppresses on these regardless of what they were called.
+    count_cols: set[str] = field(default_factory=set)
 
     @property
     def worst(self) -> str:
@@ -81,6 +104,7 @@ class Verdict:
             "classification": self.worst,
             "tables": self.tables,
             "group_keys": sorted(self.group_keys),
+            "count_cols": sorted(self.count_cols),
             "reasons": self.reasons,
             "sql": self.sql,
         }
@@ -190,6 +214,16 @@ def _has_window(e: exp.Expression) -> bool:
     return any(isinstance(n, exp.Window) for n in e.walk())
 
 
+def _value_agg(e: exp.Expression) -> str | None:
+    """Name of the first value-preserving aggregate in the expression, if any."""
+    for n in e.walk():
+        if isinstance(n, _VALUE_AGGS):
+            return n.sql_name().lower()
+        if isinstance(n, exp.Anonymous) and n.name.lower() in _VALUE_AGG_NAMES:
+            return n.name.lower()
+    return None
+
+
 def _group_keys(select: exp.Select) -> set[str]:
     group = select.args.get("group")
     if not group:
@@ -264,9 +298,13 @@ def _cached_columns(tables: list[str], index: dict | None) -> dict[str, tuple[st
 # --- the gate ----------------------------------------------------------------
 
 
-def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
+def check(
+    sql: str, pol: dict, index: dict | None = None, dialect_name: str | None = None
+) -> Verdict:
     """Classify and rule-check a statement. `index` is the metadata cache; when
     supplied, `*` is expanded and column descriptions are screened too."""
+    global DIALECT
+    DIALECT = dialect_name or dialect()
     v = Verdict(allowed=False, sql=sql.strip())
 
     # R0 — parseable, single, read-only.
@@ -288,7 +326,8 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
     tree = statements[0]
     if not isinstance(tree, _ALLOWED_ROOT):
         v.reasons.append(
-            f"{type(tree).__name__.upper()} is not permitted — phi-airgap is read-only, SELECT only."
+            f"{type(tree).__name__.upper()} is not permitted — phi-airgap is read-only, "
+            "SELECT only."
         )
         return v
 
@@ -319,7 +358,10 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
             inner = e.unalias() if isinstance(e, exp.Alias) else e
             if not _has_aggregate(inner):
                 v.group_keys.add((e.alias_or_name or "").lower())
+            elif isinstance(inner, exp.Count):
+                v.count_cols.add((e.alias_or_name or "").lower())
     v.group_keys.discard("")
+    v.count_cols.discard("")
 
     # R3 — identifier columns, anywhere in the statement. `*` is expanded from
     # the metadata cache first, so `select * from a_green_table` is screened on
@@ -397,6 +439,13 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
                         "so they are not aggregation."
                     )
                     continue
+                # R8 — value-preserving aggregates return row values.
+                if fn := _value_agg(inner):
+                    v.reasons.append(
+                        f"Output expression `{e.sql(dialect=DIALECT)}` uses `{fn}` over "
+                        f"{listing}, which returns individual row values, not a statistic."
+                    )
+                    continue
                 if _has_aggregate(inner):
                     continue
                 text = inner.sql(dialect=DIALECT).lower()
@@ -424,12 +473,12 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
 
             # R6 — k-anonymity needs a count to act on. Without one, an
             # `avg(los_days)` over a group of three is three patients' data.
-            if aggregated and not _projects_count(select, pol):
+            if aggregated and not _projects_count(select):
                 v.reasons.append(
-                    f"No count-like output column, so k-anonymity suppression cannot "
-                    f"apply to this aggregate over {listing}. Add `count(*) as n` (or "
-                    "another column matching policy.yml count_columns) so small cells "
-                    "can be suppressed."
+                    f"No bare `count(...)` output column, so k-anonymity suppression cannot "
+                    f"apply to this aggregate over {listing}. Add `count(*) as n` so small "
+                    "cells can be suppressed (an arithmetic count like `count(*) * 100` "
+                    "does not qualify)."
                 )
 
             # R7 — the "let me just peek at 10 rows" habit, and paging it.
@@ -444,13 +493,13 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
     return v
 
 
-def _projects_count(select: exp.Select, pol: dict) -> bool:
-    patterns = [p.lower() for p in pol.get("count_columns", []) or []]
-    for e in select.expressions:
-        name = (e.alias_or_name or "").lower()
-        if name and any(fnmatch(name, p) for p in patterns):
-            return True
-        inner = e.unalias() if isinstance(e, exp.Alias) else e
-        if any(isinstance(n, exp.Count) for n in inner.walk()):
-            return True
-    return False
+def _projects_count(select: exp.Select) -> bool:
+    """At least one projection is a bare `count(...)` (not `count(*) * 100`).
+
+    Name matching against policy count_columns is deliberately NOT done here:
+    `count(*) * 100 as n` defeats k-anon while wearing a count-like name.
+    """
+    return any(
+        isinstance(e.unalias() if isinstance(e, exp.Alias) else e, exp.Count)
+        for e in select.expressions
+    )

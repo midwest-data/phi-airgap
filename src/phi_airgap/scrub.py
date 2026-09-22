@@ -110,6 +110,8 @@ class ScrubReport:
     ner_hits: list[dict] = field(default_factory=list)
     day_precision_dates: int = 0
     presidio_ran: bool = False
+    # NER stopped scanning after `budget` characters; the rest was regex-only.
+    ner_budget_exhausted: bool = False
 
     @property
     def alarm(self) -> bool:
@@ -121,6 +123,7 @@ class ScrubReport:
             "cells_suppressed": self.cells_suppressed,
             "rows_suppressed": self.rows_suppressed,
             "presidio_ran": self.presidio_ran,
+            "ner_budget_exhausted": self.ner_budget_exhausted,
             "alarm": self.alarm,
             "regex_hits": self.regex_hits[:50],
             "ner_hits": self.ner_hits[:50],
@@ -272,7 +275,10 @@ def cell_scan(
                 value = cleaned
             report.day_precision_dates += len(_DAY_PRECISION_DATE.findall(value))
 
-            if not run_ner or c in ner_skip or _NUMERIC.match(value) or spent > budget:
+            if not run_ner or c in ner_skip or _NUMERIC.match(value):
+                continue
+            if spent > budget:
+                report.ner_budget_exhausted = True
                 continue
             spent += len(value)
             found = _hits(value)

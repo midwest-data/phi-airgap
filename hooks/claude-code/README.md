@@ -1,9 +1,17 @@
 # Claude Code enforcement hook
 
-`pretool-phi-airgap.py` is a Claude Code `PreToolUse` hook. It denies the Bash and
-Read tool calls that would put row-grain data into the agent's context —
-executing a query, reading a credential, opening a raw extract. It is the
-**braces**; the `CLAUDE.md` protocol block below is the **belt**.
+`pretool-phi-airgap.py` is a Claude Code `PreToolUse` hook, shipped inside the
+package at `phi_airgap/data/`. It denies the Bash, Read, Grep, Write and Edit
+tool calls that would put row-grain data into the agent's context — executing a
+query, reading a credential, opening a raw extract — and the writes that would
+rewrite the control plane (the policy/config files, the hook itself,
+`~/.claude/settings.json`). It is the **braces**; the `CLAUDE.md` protocol block
+below is the **belt**.
+
+Leading wrappers are peeled before the command-position token is judged, so
+`uv run phi-airgap run`, `env python3 -c …`, `timeout 30 databricks …`,
+`bash -c "…"` and `python3 -m phi_airgap.cli run` are all denied like their
+bare forms.
 
 The hook is standalone and dependency-free: it runs on the system Python with no
 third-party packages. It reads a few scalars from your config (see below), and
@@ -12,11 +20,13 @@ because a broken governance hook must never wedge the agent.
 
 ## Install
 
+`phi-airgap init` does all of the following. By hand:
+
 1. Copy the hook where your harness can run it, e.g.:
 
    ```bash
    mkdir -p ~/.claude/hooks
-   cp hooks/claude-code/pretool-phi-airgap.py ~/.claude/hooks/
+   cp "$(python3 -c 'import phi_airgap.util as u; print(u.DATA)')"/pretool-phi-airgap.py ~/.claude/hooks/
    chmod +x ~/.claude/hooks/pretool-phi-airgap.py
    ```
 
@@ -29,18 +39,18 @@ because a broken governance hook must never wedge the agent.
      API key). Empty ⇒ every Keychain read is denied.
 
    ```bash
-   mkdir -p ~/.phi-airgap && cp config.example.yml ~/.phi-airgap/config.yml   # then edit
+   phi-airgap init   # or copy phi_airgap/data/config.example.yml to ~/.phi-airgap/config.yml
    ```
 
 3. Register it in `~/.claude/settings.json` under `PreToolUse`, matching the
-   `Bash` and `Read` tools:
+   Bash, Read, Grep, Write and Edit tools:
 
    ```json
    {
      "hooks": {
        "PreToolUse": [
          {
-           "matcher": "Bash|Read",
+           "matcher": "Bash|Read|Write|Edit|MultiEdit|Grep",
            "hooks": [
              {
                "type": "command",
@@ -53,8 +63,9 @@ because a broken governance hook must never wedge the agent.
    }
    ```
 
-4. Verify: `phi-airgap doctor` checks the hook is present and registered, and
-   `phi-airgap selftest` red-teams it (it subprocesses the real hook).
+4. Verify: `phi-airgap doctor` checks the hook is present, byte-identical to
+   the packaged version, registered, and actually denies `phi-airgap run` when
+   invoked; `phi-airgap selftest` red-teams the packaged hook.
 
 ## Bypass
 
