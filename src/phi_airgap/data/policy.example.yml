@@ -47,14 +47,14 @@ amber:
 # leak. Checked BEFORE amber so a carve-out that physically lives inside a mart
 # catalog is not swallowed by the broad `analytics.*` pattern; still loses to red.
 #
-# Deliberately keyed on the `agg_` pre-aggregation prefix rather than a bare
-# `*_month` glob — `*_month` would quietly promote any row-grain daily mart that
-# happens to end in _month.
+# GREEN patterns MUST be fully qualified to schemas the agent cannot write to.
+# A bare `agg_*` glob let the agent mint a GREEN relation with `dbt run` and read
+# rows through it. Anything in a `dev_*` schema or a `*_dev` catalog is degraded
+# to AMBER by the gate regardless of what matches here, and `phi-airgap dbt run`
+# refuses to build a relation that classifies GREEN.
 green:
   - "reporting.*"                 # dedicated pre-aggregated reporting catalog
   - "*.reporting.*"
-  - "agg_*"                       # `agg_` = pre-aggregated, one row per entity/period
-  - "*.agg_*"
   - "*.metric_targets"            # target values, not observations
   - "*.targets.*"
   - "*.information_schema.*"      # column metadata is not PHI
@@ -98,6 +98,16 @@ allow_columns:
   - "catalog_name"
   - "model_name"
   - "file_name"
+  # Reporting periods: coarser than a day, so not Safe Harbor dates.
+  - "*_year"
+  - "*_month"
+  - "*_yr"
+  - "*_mo"
+  - "*period*"
+  - "metric_date"
+  - "report_date"
+  - "as_of_date"
+  - "*metric_description*"
 
 deny_columns:
   - "*name*"
@@ -121,6 +131,39 @@ deny_columns:
   - "*guarantor*"
   - "*zip*"
   - "*postal*"
+  - "*ssn*"
+  # Safe Harbor dates and ages. A date column is tolerated by the gate ONLY
+  # inside date_trunc('month'|'quarter'|'year', col), year(col) or month(col).
+  - "*_date"
+  - "*_dt"
+  - "*_ts"
+  - "*_time"
+  - "*timestamp*"
+  - "dod"
+  - "*death*"
+  - "admit*"
+  - "*_admit*"
+  - "discharge*"
+  - "*_discharge*"
+  - "age"
+  - "*_age"
+  - "age_*"
+  # Free text: min/max over it returns one person's record; the description
+  # denylist below cannot see an undocumented column.
+  - "*diagnos*"
+  - "*notes*"
+  - "*comment*"
+  - "*_text"
+  - "*text_*"
+  - "*narrative*"
+  - "*reason*"
+  - "*description*"
+  # Re-identifying keys. Enumerate EVERY person key in your warehouse here —
+  # grouping by one lists individuals, and k-anonymity only blanks the count.
+  - "*external*id*"
+  - "*person*"
+  - "*member*id*"
+  - "*subscriber*"
 
 # ── Description denylist — catches identifiers whose NAME is opaque ─────────
 # Matched (fnmatch, lowercased) against the warehouse/model description of every
@@ -152,6 +195,8 @@ deny_descriptions:
   - "*passport*"
   - "*account number*"
   - "*health plan*number*"
+  - "*free text*"
+  - "*clinical note*"
 
 # ── Count columns — drive k-anonymity suppression ───────────────────────────
 # A row whose count falls below k_threshold (config.yml, default 11) has that

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hook-version: 1.1.0
+# hook-version: 1.2.0
 """
 PreToolUse:Bash|Read|Write|Edit|MultiEdit|Grep Hook: PHI Airgap enforcement (Claude Code).
 
@@ -8,19 +8,26 @@ LLM agent's context. Instructions in CLAUDE.md are the belt; this hook is the
 braces — it denies the tool call regardless of what the prose says.
 
 This is a HARD GATE — it prints a JSON permissionDecision:deny to block, and
-otherwise exits 0 to allow.
+otherwise exits 0 to allow. It FAILS CLOSED: malformed input or a crash exits 2
+(the harness blocks the tool) unless config `hook_fail_open: true`.
+
+This hook is a best-effort DENYLIST against direct invocation. It is not a
+sandbox: uninspected runtimes exist, and the real boundary is the deployment
+shape (SECURITY.md "Required deployment shape") — the agent's OS identity must
+hold no warehouse credential and no network route to the warehouse.
 
 Every decision is made per execution segment, on the token in COMMAND position,
 after leading wrappers (env, nice, timeout, sudo, uv run, poetry run, xargs, ...)
 are stripped and `bash -c "<str>"` / `python -m phi_airgap` are unwrapped.
-A command that merely mentions `.env` in a commit message or a heredoc body is
-not executing it, and denying that made the hook unusable for writing about the
-phi-airgap itself.
+Script files handed to a shell (`bash s.sh`, `source s.sh`, `./s.sh`) and shell
+heredoc bodies are read and judged as shell code too.
 
 Denied on Bash:
-- the warehouse SQL client (databricks / dbsql) invoked directly
-- any python/uv/ipython invocation whose command text, heredoc body, or target
-  .py file imports the warehouse driver or duckdb, or opens a .parquet
+- a SQL client (databricks / dbsql / psql / sqlite3 / mysql / snowsql / bq / ...)
+- any interpreter invocation (python, uv, node, ruby, perl, php, R, ...) whose
+  command text, heredoc body, or script file mentions a warehouse driver, an
+  HTTP/socket library, Keychain/keyring access, subprocess, the phi-airgap
+  internals, duckdb, a .parquet file, or the configured warehouse host
 - dbt show / dbt run-operation (these print result rows), incl. via `phi-airgap dbt`
 - reading a credential out of Keychain, EXCEPT the one non-sensitive service
   named by config `readable_keychain_service` (empty by default → all denied)
@@ -28,9 +35,11 @@ Denied on Bash:
 - phi-airgap run / uninstall / adopt, and `phi-airgap refresh` without --offline
 - reading a .env / .envrc / .env.<suffix> with a reader command, and redirecting
   into any of them (.env.example / .env.template / .env.sample stay readable)
-- writing to the control plane: the policy/config files, this hook, and
-  ~/.claude/settings.json (sed -i, tee, cp, mv, rm, >, >>, truncate, chmod, editors).
-  The policy is the ACL; the human edits it.
+- writing to the control plane: the policy/config files, this hook, any
+  .claude/settings*.json, the audit log (.phi-airgap/log.jsonl, ~/.phi-airgap/audit/),
+  the query history (.phi-airgap/out/history/) and ~/.phi-airgap/BYPASS
+  (sed -i, tee, cp, mv, rm, >, >>, truncate, chmod, editors). The policy is the
+  ACL; the human edits it.
 
 Denied on Read / Grep (path):
 - *.parquet, *.duckdb, .phi-airgap/out/*.raw.*, **/.envrc, **/.env(.local|...)
@@ -42,11 +51,14 @@ Allow-through:
 - everything else, including `phi-airgap schema`, `phi-airgap scrub`, `phi-airgap log`,
   `phi-airgap doctor`, `phi-airgap selftest`, `phi-airgap refresh --offline`,
   `phi-airgap dbt run/test/build`, and all normal git/dbt/gh/file work
-- PHI_AIRGAP_BYPASS=1 env var
+- the file ~/.phi-airgap/BYPASS exists (human-created; the hook itself denies
+  the agent creating it, and `phi-airgap doctor` reports it)
 
-Config: read from $PHI_AIRGAP_CONFIG, else ~/.phi-airgap/config.yml. Only flat scalars
-are read (no yaml dependency — the hook runs on the system python). Missing
-config falls back to safe defaults: no readable Keychain service, host unset.
+Config: ~/.phi-airgap/config.yml. $PHI_AIRGAP_CONFIG is honoured only if it points
+under ~/.phi-airgap/ or PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1 is set (the selftest sets
+it). Only flat scalars are read (no yaml dependency — the hook runs on the
+system python). Missing config falls back to safe defaults: no readable
+Keychain service, host unset, fail closed.
 
 Verified by tests/test_airgap.py (`phi-airgap selftest`).
 """
@@ -59,7 +71,8 @@ import sys
 import traceback
 from pathlib import Path
 
-_BYPASS_ENV = "PHI_AIRGAP_BYPASS"
+_HOME_DIR = Path.home() / ".phi-airgap"
+_BYPASS_FILE = _HOME_DIR / "BYPASS"
 
 _PROTOCOL = (
     "PHI AIRGAP: live row-grain data must not reach your context. Do not execute "
@@ -71,7 +84,25 @@ _PROTOCOL = (
 
 # --- config (dependency-free flat-scalar reader) -----------------------------
 
-_CONFIG = Path(os.environ.get("PHI_AIRGAP_CONFIG") or Path.home() / ".phi-airgap" / "config.yml")
+
+def _env_path(env: str, default: Path) -> Path:
+    """$ENV override, honoured only under ~/.phi-airgap/ or with the explicit
+    PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1 — otherwise a settings `env` block could
+    point the hook at a config the agent wrote."""
+    v = os.environ.get(env)
+    if not v:
+        return default
+    p = Path(v).expanduser()
+    try:
+        under_home = p.resolve().is_relative_to(_HOME_DIR.resolve())
+    except (OSError, RuntimeError):
+        under_home = False
+    if under_home or os.environ.get("PHI_AIRGAP_ALLOW_ENV_OVERRIDE") == "1":
+        return p
+    return default
+
+
+_CONFIG = _env_path("PHI_AIRGAP_CONFIG", _HOME_DIR / "config.yml")
 
 
 def _config_value(key: str, fallback: str) -> str:
@@ -99,24 +130,34 @@ def _warehouse_host() -> str:
 
 # --- the control plane --------------------------------------------------------
 # The policy is the ACL the gate enforces; the hook and settings.json are what
-# make it bite. The agent may read them, never rewrite them.
+# make it bite. The agent may read them, never rewrite them. The audit log and
+# the query history are the record; the agent may read them, never rewrite them.
 
 _PROTECTED_SUFFIXES = (
     "/.phi-airgap/policy.yml",
     "/.phi-airgap/config.yml",
+    "/.phi-airgap/log.jsonl",
+    "/.phi-airgap/BYPASS",
     "/.claude/hooks/pretool-phi-airgap.py",
     "/.claude/settings.json",
+    "/.claude/settings.local.json",
 )
+# Directories whose every file is protected.
+_PROTECTED_DIRS = ("/.phi-airgap/audit/", "/.phi-airgap/out/history/")
+# Any settings file of the harness: settings.json, settings.local.json, settings.<x>.json.
+_SETTINGS_FILE = re.compile(r"/\.claude/settings[^/]*\.json$")
 
 
 def _protected_files() -> set[str]:
     home = Path.home()
     files = {
         _CONFIG,
-        Path(os.environ.get("PHI_AIRGAP_POLICY") or home / ".phi-airgap" / "policy.yml"),
+        _env_path("PHI_AIRGAP_POLICY", _HOME_DIR / "policy.yml"),
         home / ".claude" / "hooks" / "pretool-phi-airgap.py",
         home / ".claude" / "settings.json",
-        *(home / ".phi-airgap").glob("*.yml"),
+        home / ".claude" / "settings.local.json",
+        _BYPASS_FILE,
+        *_HOME_DIR.glob("*.yml"),
     }
     return {str(Path(f).expanduser().resolve()) for f in files}
 
@@ -129,19 +170,24 @@ def _is_protected(token: str) -> bool:
         resolved = str(Path(os.path.expanduser(tok)).resolve())
     except (OSError, RuntimeError):
         resolved = tok
-    return resolved in _protected_files() or resolved.endswith(_PROTECTED_SUFFIXES)
+    return (
+        resolved in _protected_files()
+        or resolved.endswith(_PROTECTED_SUFFIXES)
+        or any(d in resolved + "/" for d in _PROTECTED_DIRS)
+        or bool(_SETTINGS_FILE.search(resolved))
+    )
 
 
 _PROTECTED_REASON = (
     "The policy is the ACL; the human edits it. Writing to the phi-airgap policy/config, "
-    "the enforcement hook or ~/.claude/settings.json is blocked. Ask the user to make the "
-    "change."
+    "the enforcement hook, .claude/settings*.json, the audit log or the query history is "
+    "blocked. Ask the user to make the change."
 )
 
 # Command-position executables that overwrite or delete their path arguments.
 _WRITERS = {
     "tee", "cp", "mv", "rm", "truncate", "chmod", "chown", "install", "ln", "dd", "rsync",
-    "vim", "vi", "nano", "emacs", "code", "open", "shred", "unlink", "touch",
+    "vim", "vi", "nano", "emacs", "code", "open", "shred", "unlink", "touch", "mkdir",
 }
 
 
@@ -160,24 +206,38 @@ def _writes_protected(words: list[str]) -> bool:
 
 # --- Bash patterns -----------------------------------------------------------
 
-# Command-position executables that talk to the warehouse directly.
-_SQL_CLIENTS = {"databricks", "dbsql", "databricks-sql", "databricks-sql-cli"}
+# Command-position executables that talk to a warehouse or a local database.
+_SQL_CLIENTS = {
+    "databricks", "dbsql", "databricks-sql", "databricks-sql-cli",
+    "psql", "sqlite3", "mysql", "mariadb", "clickhouse-client", "bq", "snowsql", "duckdb",
+    "sqlcmd",
+}
 
-# Python-ish interpreters whose payload we inspect.
+# Python-ish interpreters, unwrapped for `-m phi_airgap` / `-m dbt`.
 _PY_RUNNER_NAMES = {
     "python", "python2", "python3", "python3.11", "python3.12", "python3.13", "python3.14",
     "uv", "uvx", "ipython", "ipython3", "jupyter", "pytest", "poetry", "pipenv",
 }
+# Every interpreter whose payload is inspected.
+_INTERPRETERS = _PY_RUNNER_NAMES | {"node", "deno", "bun", "ruby", "perl", "php", "Rscript", "R"}
+_SCRIPT_FILE = re.compile(r"[\w./~-]+\.(?:py|js|ts|rb|pl|R|sh|txt)\b")
 
-# Forbidden payload inside anything a python runner would execute: a warehouse
-# driver import, or a local-data escape hatch (duckdb / a parquet extract).
+# Forbidden payload inside anything an interpreter would execute: a warehouse
+# driver, a network client, a credential store, a subprocess escape, or the
+# phi-airgap internals (which hold the credential path).
+# ponytail: a denylist chasing runtimes; the boundary is the deployment shape.
 _PY_FORBIDDEN = re.compile(
-    r"databricks[._-]?(?:sql|sdk|connect)"
-    r"|from\s+databricks\b"
-    r"|import\s+databricks\b"
+    r"\bdatabricks\b"
     r"|\bduckdb\b"
     r"|read_parquet"
-    r"|\.parquet\b",
+    r"|\.parquet\b"
+    r"|keychain|keyring|find-generic-password|\bsecurity\b.*-w"
+    r"|subprocess|os\.system|os\.popen|os\.exec|child_process|\bexecSync\b|\bspawn\b"
+    r"|importlib|__import__|\bexec\s*\(|\beval\s*\("
+    r"|phi_airgap\.(?:util|run|adapters|cli)"
+    r"|pyodbc|psycopg|snowflake|sqlalchemy|databricks://"
+    r"|urllib|requests|http\.client|httpx|aiohttp|socket\b"
+    r"|\bfetch\s*\(|\bnet\.connect|Net::HTTP|net/https?\b|LWP::|curl_init",
     re.IGNORECASE,
 )
 
@@ -243,8 +303,8 @@ def _split_heredocs(command: str) -> tuple[str, str]:
 
     A heredoc body is DATA. Segmenting it as if it were code is what made this
     hook refuse `python3 - <<PY ... PY` scripts that merely mention `.env`. The
-    body is still inspected — but only for the interpreter payload check, where
-    it genuinely is executed.
+    body is still inspected — as an interpreter payload, and as shell code when
+    a shell is what reads it (`bash <<EOF`).
     """
     bodies = [m.group(2) for m in _HEREDOC.finditer(command)]
     return _HEREDOC.sub(lambda m: f"<<{m.group(1)}", command), "\n".join(bodies)
@@ -266,7 +326,10 @@ def _segments(command: str) -> list[list[str]]:
     # punctuation_chars.
     command = command.replace("`", " ; ")
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        # A newline is an operator, not whitespace: with the default lexer,
+        # `git status\nphi-airgap run q.sql` was one segment beginning `git`.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:  # unbalanced quotes — fall back to the coarse split
@@ -274,7 +337,8 @@ def _segments(command: str) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
     for tok in tokens:
-        if tok in _OPERATORS:
+        tok = tok.replace("\n", "") if "\n" in tok and set(tok) <= set("();<>|&\n") else tok
+        if tok in _OPERATORS or tok == "":
             if current:
                 segments.append(current)
             current = []
@@ -355,17 +419,19 @@ def _subcommand(words: list[str]) -> str:
     return next((w for w in words[1:] if not w.startswith("-")), "")
 
 
+def _read_local(tok: str) -> str:
+    p = Path(os.path.expanduser(tok.strip("'\"")))
+    try:
+        if p.is_file() and p.stat().st_size < 512_000:
+            return p.read_text(errors="replace")
+    except OSError:
+        pass
+    return ""
+
+
 def _script_payload(command: str) -> str:
-    """Concatenate the contents of any local .py files named in the command."""
-    out = []
-    for tok in re.findall(r"[\w./~-]+\.py\b", command):
-        p = Path(os.path.expanduser(tok))
-        try:
-            if p.is_file() and p.stat().st_size < 512_000:
-                out.append(p.read_text(errors="replace"))
-        except OSError:
-            pass
-    return "\n".join(out)
+    """Concatenate the contents of any local script files named in the command."""
+    return "\n".join(filter(None, (_read_local(t) for t in _SCRIPT_FILE.findall(command))))
 
 
 def _warehouse_http(code: str) -> bool:
@@ -380,7 +446,7 @@ def _warehouse_http(code: str) -> bool:
     )
 
 
-def _check_bash(command: str) -> str | None:
+def _check_bash(command: str, depth: int = 0) -> str | None:
     """Return a deny reason, or None to allow.
 
     Decisions are made per execution segment, on the token in COMMAND position.
@@ -388,6 +454,8 @@ def _check_bash(command: str) -> str | None:
     a commit message is not executing it, and blocking that made the hook
     unusable for writing about the phi-airgap.
     """
+    if depth > 5:  # a script that sources itself
+        return "Script indirection too deep to inspect. " + _PROTOCOL
     code, heredocs = _split_heredocs(command)
 
     if _warehouse_http(code):
@@ -408,11 +476,23 @@ def _check_bash(command: str) -> str | None:
                 + _PROTOCOL
             )
 
-        # `bash -c "<script>"`: the script is shell code, judge it as such.
-        if exe in _SHELLS:
-            i = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-\w*c\w*$", w)), None)
-            if i is not None and i + 1 < len(words) and (r := _check_bash(words[i + 1])):
-                return r
+        # Script indirection: a shell reading a script file or a heredoc is
+        # executing shell code; judge that code as if it were typed here.
+        if exe in _SHELLS or exe in ("source", ".") or words[0].startswith("./") \
+                or exe.endswith(".sh"):
+            if exe in _SHELLS:
+                i = next(
+                    (i for i, w in enumerate(words[1:], 1) if re.match(r"^-\w*c\w*$", w)), None
+                )
+                if i is not None and i + 1 < len(words):
+                    if r := _check_bash(words[i + 1], depth + 1):
+                        return r
+                if heredocs and (r := _check_bash(heredocs, depth + 1)):
+                    return r
+            target = words[0] if exe not in _SHELLS and exe not in ("source", ".") else sub
+            if target and (body := _read_local(target)):
+                if r := _check_bash(body, depth + 1):
+                    return r + f" (inside {target})"
 
         if _writes_protected(words):
             return _PROTECTED_REASON + " " + _PROTOCOL
@@ -457,13 +537,16 @@ def _check_bash(command: str) -> str | None:
                 "are readable. `phi-airgap doctor` checks credential hygiene. " + _PROTOCOL
             )
 
-        if exe in _PY_RUNNER_NAMES or exe.endswith(".py"):
+        if exe in _INTERPRETERS or exe.endswith((".py", ".js", ".rb", ".pl")):
             payload = seg + "\n" + heredocs + "\n" + _script_payload(seg)
             if m := _PY_FORBIDDEN.search(payload):
                 return (
-                    f"This Python invocation reaches live data (matched {m.group(0)!r}). "
-                    + _PROTOCOL
+                    f"This interpreter invocation reaches live data or a credential "
+                    f"(matched {m.group(0)!r}). " + _PROTOCOL
                 )
+            host = _warehouse_host()
+            if host and host.lower() in payload.lower():
+                return "This interpreter invocation names the warehouse host. " + _PROTOCOL
 
     return None
 
@@ -517,6 +600,12 @@ def _deny(reason: str) -> None:
     sys.exit(0)
 
 
+def _fail_closed(why: str) -> None:
+    """Exit 2: the harness blocks the tool and shows stderr to the agent."""
+    print(f"[phi-airgap] hook failed closed: {why}", file=sys.stderr)
+    sys.exit(2)
+
+
 def main() -> None:
     debug = os.environ.get("CLAUDE_HOOKS_DEBUG")
 
@@ -526,11 +615,12 @@ def main() -> None:
     try:
         event = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        sys.exit(0)
+        _fail_closed("input is not JSON")
+    if not isinstance(event, dict) or not isinstance(event.get("tool_input", {}) or {}, dict):
+        _fail_closed("unexpected event shape")
 
-    if os.environ.get(_BYPASS_ENV) == "1":
-        if debug:
-            print("[phi-airgap] Bypassed via PHI_AIRGAP_BYPASS=1", file=sys.stderr)
+    if _BYPASS_FILE.exists():
+        print(f"[phi-airgap] BYPASSED: {_BYPASS_FILE} exists", file=sys.stderr)
         sys.exit(0)
 
     tool = event.get("tool_name", "")
@@ -556,12 +646,13 @@ if __name__ == "__main__":
     try:
         main()
     except SystemExit:
-        raise  # Let sys.exit(0) propagate normally
+        raise
     except Exception as e:
         if os.environ.get("CLAUDE_HOOKS_DEBUG"):
             traceback.print_exc(file=sys.stderr)
         else:
             print(f"[phi-airgap] Error: {type(e).__name__}: {e}", file=sys.stderr)
-        # A crashed hook must fail OPEN — never block tools.
-    finally:
-        sys.exit(0)
+        # A crashed hook fails CLOSED unless the human opted out in config.
+        if _config_value("hook_fail_open", "false").lower() == "true":
+            sys.exit(0)
+        sys.exit(2)

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +42,7 @@ def cmd_run(args) -> int:
     path = Path(args.file)
     if not path.exists():
         util.die(f"{path} not found. The agent writes SQL to .phi-airgap/q.sql.")
-    return run.run_file(path)
+    return run.run_file(path, purpose=args.purpose)
 
 
 def cmd_check(args) -> int:
@@ -56,7 +58,8 @@ def cmd_check(args) -> int:
     if not path.exists():
         util.die(f"{path} not found")
     index = meta.load() if meta.cache_path().exists() else None
-    v = gate.check(path.read_text(), util.policy(), index)
+    sql = path.read_text()
+    v = gate.check(sql, util.policy(), index)
 
     print(f"{'ALLOW' if v.allowed else 'DENY '} [{v.worst}]  {path}")
     for table, level in sorted(v.tables.items()):
@@ -65,8 +68,12 @@ def cmd_check(args) -> int:
         print(f"  - {r}")
     if v.allowed:
         print(f"\nGate only — no data was read. Ask the user to run:  ! phi-airgap run {path}")
-    util.audit(event="check", source=str(path), verdict="ALLOW" if v.allowed else "DENY",
-               classification=v.worst, reasons=v.reasons)
+    util.audit(
+        event="check", source=str(path), verdict="ALLOW" if v.allowed else "DENY",
+        classification=v.worst, reasons=v.reasons, sql=sql.strip(),
+        sql_sha256=hashlib.sha256(sql.encode()).hexdigest(), group_keys=sorted(v.group_keys),
+        user=getpass.getuser(), host=socket.gethostname(),
+    )
     return 0 if v.allowed else 1
 
 
@@ -106,6 +113,66 @@ def _default_manifests() -> list[Path]:
     )
 
 
+# dbt subcommands that materialise a relation. Their targets may not be GREEN.
+DBT_WRITES = {"run", "build", "seed", "snapshot"}
+_SELECT_FLAGS = {"--select", "-s", "--models", "-m", "--model"}
+
+
+def _dbt_selectors(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    take = False
+    for a in argv:
+        if a in _SELECT_FLAGS:
+            take = True
+            continue
+        if a.startswith(tuple(f + "=" for f in _SELECT_FLAGS)):
+            out.extend(a.split("=", 1)[1].split())
+            continue
+        if a.startswith("-"):
+            take = False
+            continue
+        if take:
+            out.extend(a.split())
+    return out
+
+
+def _green_dbt_targets(selectors: list[str]) -> list[str]:
+    """Relations a dbt write would materialise that classify GREEN, or the
+    reason the check cannot be made. GREEN is exempt from every aggregation
+    rule, so a relation the agent can build must never be GREEN."""
+    from . import gate, meta
+
+    if not meta.cache_path().exists():
+        util.die("no metadata cache — run `phi-airgap refresh --offline` before `dbt run`.", 1)
+    index = meta.load()
+    pol = util.policy()
+    if not selectors:  # a whole-project run touches every model
+        hits = {k: v for k, v in index.items() if v.get("kind") in ("model", "seed", "snapshot")}
+    else:
+        hits = {}
+        for sel in selectors:
+            name = re.sub(r"^[@+\d]*|[+]\d*$", "", sel)
+            if ":" in name or not name:
+                util.die(
+                    f"selector `{sel}` cannot be resolved to relations — use model names, "
+                    "so each target can be classified.",
+                    1,
+                )
+            found = meta.find(name, index)
+            if not found:
+                util.die(
+                    f"`{sel}` is not in the metadata cache — run `phi-airgap refresh --offline`.",
+                    1,
+                )
+            hits.update(found)
+    green = []
+    for key in hits:
+        cat, sch, tbl = (["", ""] + key.split("."))[-3:]
+        if gate.classify(cat, sch, tbl, pol) == "GREEN":
+            green.append(key)
+    return green
+
+
 def cmd_dbt(args) -> int:
     from . import scrub
 
@@ -116,6 +183,12 @@ def cmd_dbt(args) -> int:
         util.die(f"`dbt {sub}` prints result rows and is blocked by the phi-airgap.", 1)
     if not cfg.get("allow_claude_dbt", True) and os.environ.get("CLAUDECODE"):
         util.die("allow_claude_dbt is false in config.yml — the human must run dbt.", 1)
+    if sub in DBT_WRITES and (green := _green_dbt_targets(_dbt_selectors(argv))):
+        util.die(
+            f"`dbt {sub}` would materialise a GREEN relation: {', '.join(green)}. GREEN is "
+            "exempt from aggregation, so the agent may not build it. The human runs this.",
+            1,
+        )
 
     env = dict(os.environ, DATABRICKS_TOKEN=util.keychain_get())
     proc = subprocess.run(
@@ -204,6 +277,13 @@ def cmd_doctor(args) -> int:
             _hook_denies(HOOK_INSTALL_PATH, "phi-airgap run x.sql"),
             "installed hook denies `phi-airgap run` when actually invoked",
         )
+        check(
+            _hook_exit(HOOK_INSTALL_PATH, "not json") != 0,
+            "installed hook fails closed on malformed input",
+            "set hook_fail_open: false in config.yml",
+        )
+    bypass = util.HOME_DIR / "BYPASS"
+    check(not bypass.exists(), f"no bypass file at {bypass}", f"rm {bypass}")
     registered = False
     if SETTINGS.exists():
         registered = "pretool-phi-airgap.py" in SETTINGS.read_text()
@@ -220,6 +300,18 @@ def cmd_doctor(args) -> int:
 
     cache = meta.cache_path()
     check(cache.exists(), f"metadata cache {cache}", "phi-airgap refresh")
+
+    print("\naudit log")
+    ws_log, home_log = util.phi_airgap_dir() / "log.jsonl", util.home_audit_path()
+    for label, path in (("workspace", ws_log), ("home mirror", home_log)):
+        ok, line = util.verify_chain(path)
+        check(ok, f"{label} chain intact: {path}" + ("" if ok else f" (breaks at line {line})"),
+              "the log was edited or truncated — investigate before trusting the banner")
+    check(
+        util.tails_match(),
+        "workspace log and home mirror agree on the last entry",
+        "the workspace log was rewritten; the home mirror is the record",
+    )
 
     print("\nplaintext secrets on disk")
     for path, hits in _scan_secrets(util.root()):
@@ -243,6 +335,15 @@ def cmd_doctor(args) -> int:
 def _hook_version(path: Path) -> str:
     m = re.search(r"^# hook-version:\s*(\S+)", path.read_text(errors="replace"), re.M)
     return m.group(1) if m else "unknown"
+
+
+def _hook_exit(hook: Path, stdin: str) -> int:
+    try:
+        return subprocess.run(
+            [sys.executable, str(hook)], input=stdin, capture_output=True, text=True, timeout=20
+        ).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
 
 
 def _hook_denies(hook: Path, command: str) -> bool:
@@ -407,7 +508,9 @@ def cmd_log(args) -> int:
             continue
         head = f"{e.get('ts', '')}  {e.get('event', ''):<8} {e.get('verdict', ''):<10}"
         detail = e.get("source") or " ".join(map(str, e.get("args", []))) or e.get("file", "")
-        print(f"{head} {detail}")
+        sha = e.get("sql_sha256", "")[:8]
+        who = " ".join(x for x in (sha, e.get("user", ""), e.get("purpose", "")) if x)
+        print(f"{head} {detail}" + (f"  [{who}]" if who else ""))
         for r in e.get("reasons", [])[:3]:
             print(f"    - {r}")
     return 0
@@ -463,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="gate, execute and scrub a .sql file")
     r.add_argument("file")
+    r.add_argument("--purpose", help="why this query is being run (recorded in the audit log)")
     r.set_defaults(fn=cmd_run)
 
     k = sub.add_parser("check", help="run the gate on a .sql file without executing it")

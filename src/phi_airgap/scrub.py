@@ -2,7 +2,7 @@
 
 Three independent passes:
   1. structural column check  — deterministic, HARD FAIL (nothing is emitted)
-  2. k-anonymity suppression  — small cells become "<11"
+  2. k-anonymity suppression  — a row with a count below k is blanked whole
   3. Presidio NER             — the ALARM. A hit means the gate leaked and the
                                 policy needs fixing; it is not a save.
 
@@ -12,6 +12,7 @@ proof that a result set is PHI-free.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
@@ -197,6 +198,10 @@ def _looks_numeric(rows: list[list], idx: int) -> bool:
     return seen
 
 
+# A group-key cell that is a literal total — the UNION ALL / ROLLUP marginal.
+_TOTAL_CELLS = {"all", "total", "", None}
+
+
 def suppress(
     columns: list[str],
     rows: list[list],
@@ -206,29 +211,41 @@ def suppress(
 ) -> tuple[int, int]:
     """k-anonymity suppression, in place. Returns (cells changed, rows hit).
 
-    A row whose count falls below k has its measures suppressed too, not just
-    the count — otherwise a mean or a sum over 3 patients still walks out.
+    A row whose count falls below k is blanked ENTIRELY — group keys included.
+    Blanking only the measures left the keys as a near-unique list (an
+    existence probe: `admit_date, age, '<11'` names a person). Then, if any row
+    was blanked, every marginal row (group keys all literal totals) is blanked
+    too, or the suppressed cell is recoverable by subtraction.
     """
     count_idx = [i for i, c in enumerate(columns) if _is_count_col(c, count_patterns)]
     if not count_idx:
         return 0, 0
     keys = {g.lower() for g in group_keys}
-    measure_idx = [
-        i
-        for i, c in enumerate(columns)
-        if c.lower() not in keys and (i in count_idx or _looks_numeric(rows, i))
-    ]
+    key_idx = [i for i, c in enumerate(columns) if c.lower() in keys]
+
+    def blank(row: list) -> int:
+        n = 0
+        for i in range(len(row)):
+            if row[i] != SUPPRESSED:
+                row[i] = SUPPRESSED
+                n += 1
+        return n
 
     changed = 0
     hit_rows = 0
     for row in rows:
-        if not any(_small(row[i], k) for i in count_idx):
-            continue
-        hit_rows += 1
-        for i in measure_idx:
-            if row[i] != SUPPRESSED:
-                row[i] = SUPPRESSED
-                changed += 1
+        if any(_small(row[i], k) for i in count_idx):
+            hit_rows += 1
+            changed += blank(row)
+    if hit_rows and key_idx:
+        for row in rows:
+            cells = [row[i] for i in key_idx]
+            if all(
+                c != SUPPRESSED and (c is None or str(c).strip().lower() in _TOTAL_CELLS)
+                for c in cells
+            ):
+                hit_rows += 1
+                changed += blank(row)
     return changed, hit_rows
 
 
@@ -263,6 +280,9 @@ def cell_scan(
     spent = 0
     for r, row in enumerate(rows):
         for c, value in enumerate(row):
+            if isinstance(value, (_dt.date, _dt.datetime)):
+                report.day_precision_dates += 1
+                continue
             if not isinstance(value, str) or len(value) < 3:
                 continue
 
@@ -316,15 +336,17 @@ def scrub(
         columns, rows, k, count_columns, group_keys or set()
     )
 
-    # A grouping where most cells fall below k is a row dump wearing a GROUP BY.
-    # Suppressing the measures is not enough — the group keys themselves are then
-    # a near-unique list. Refuse the whole result rather than emit the keys.
-    if rows and report.rows_suppressed / len(rows) > max_suppressed_share and len(rows) > 5:
+    # A grouping where most cells fall below k is a row dump wearing a GROUP BY,
+    # and a tiny result with any suppressed row is an existence probe (the
+    # WHERE clause that produced it names the person). Refuse both outright.
+    if rows and (
+        (report.rows_suppressed and len(rows) <= 5)
+        or report.rows_suppressed / len(rows) > max_suppressed_share
+    ):
         raise ScrubFail(
             f"{report.rows_suppressed} of {len(rows)} rows fell below k={k}. That grouping "
-            "is fine-grained enough to be a row dump: suppressing the measures still "
-            "leaves a near-unique list of group keys. Nothing was written — aggregate to "
-            "a coarser grain."
+            "is fine-grained enough to be a row dump or an existence probe. Nothing was "
+            "written — aggregate to a coarser grain."
         )
 
     try:

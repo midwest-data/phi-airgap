@@ -45,6 +45,11 @@ max_suppressed_share: 0.5
 # if you did not install the [ner] extra).
 require_presidio: true
 
+# The hook fails CLOSED: malformed input or a crash exits 2 and the harness
+# blocks the tool. Set true to fail open instead (a broken hook then allows
+# everything — `phi-airgap doctor` will tell you).
+hook_fail_open: false
+
 # Row ceilings. Over the ceiling the result is REFUSED, not truncated —
 # truncating a 50,000-row name dump to 200 still emits 200 names.
 # The tight one applies whenever any RED or AMBER relation is read.

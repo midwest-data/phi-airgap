@@ -91,6 +91,14 @@ def _from_information_schema(catalogs: list[str]) -> dict:
 
 
 def build(manifests: list[Path], offline: bool) -> dict:
+    """Merge manifests and information_schema into one index.
+
+    Optional per-relation `row_count` and per-column `distinct_count` keys drive
+    gate rule R14 (person-key enumeration). Neither the dbt manifest nor
+    information_schema carries them portably, so they are absent unless a
+    deployment adds them (a `phi-airgap refresh` post-step, or by hand); R14 is
+    documented as inactive without them.
+    """
     index: dict[str, dict] = {}
     for path in manifests:
         if path.exists():

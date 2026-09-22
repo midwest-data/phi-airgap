@@ -23,11 +23,24 @@ HOME_DIR = Path.home() / ".phi-airgap"
 def _pick(env: str, name: str) -> Path:
     """$ENV override, else ~/.phi-airgap/<name>, else the packaged example.
 
-    The hook reads ~/.phi-airgap/config.yml too, so the CLI and the hook now
-    agree on which file is live.
+    The override is honoured only when it points under ~/.phi-airgap/ or
+    PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1 is set (selftest/CI). Otherwise a settings
+    `env` block could point the CLI at a policy the agent wrote. The hook
+    applies the same rule, so the CLI and the hook agree on which file is live.
     """
     if v := os.environ.get(env):
-        return Path(v).expanduser()
+        p = Path(v).expanduser()
+        try:
+            under_home = p.resolve().is_relative_to(HOME_DIR.resolve())
+        except (OSError, RuntimeError):
+            under_home = False
+        if under_home or os.environ.get("PHI_AIRGAP_ALLOW_ENV_OVERRIDE") == "1":
+            return p
+        print(
+            f"phi-airgap: ignoring {env}={v} (not under {HOME_DIR}; set "
+            "PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1 to force)",
+            file=sys.stderr,
+        )
     home = HOME_DIR / name
     return home if home.exists() else DATA / f"{name.removesuffix('.yml')}.example.yml"
 
@@ -58,6 +71,9 @@ DEFAULT_CONFIG = {
     "max_rows_sensitive": 200,
     "require_presidio": True,
     "max_suppressed_share": 0.5,
+    # The hook fails CLOSED on malformed input or a crash (exit 2). Flip to true
+    # to fail open (the pre-1.2 behaviour).
+    "hook_fail_open": False,
 }
 
 
@@ -139,10 +155,73 @@ def keychain_has(service: str) -> bool:
 # --- Audit log --------------------------------------------------------------
 
 
+def _sha(data: bytes | str) -> str:
+    return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
+
+
+def _last_line(path: Path) -> str:
+    if not path.exists():
+        return ""
+    lines = path.read_text().splitlines()
+    return lines[-1] if lines else ""
+
+
+def home_audit_path() -> Path:
+    """The per-workspace mirror of the audit log under ~/.phi-airgap/audit/.
+
+    The workspace log is agent-adjacent; this copy sits beside the hook's own
+    config and is protected by the hook. The banner baseline reads this one.
+    """
+    return HOME_DIR / "audit" / f"{_sha(str(root()))[:12]}.jsonl"
+
+
+def _append(path: Path, fields: dict) -> None:
+    """Append one hash-chained line: `prev` is sha256 of the previous raw line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev = _last_line(path)
+    line = {**fields, "prev": _sha(prev) if prev else ""}
+    new = not path.exists()
+    with path.open("a") as fh:
+        fh.write(json.dumps(line, default=str) + "\n")
+    if new:
+        path.chmod(0o600)
+
+
 def audit(**fields) -> None:
     line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **fields}
-    with (phi_airgap_dir() / "log.jsonl").open("a") as fh:
-        fh.write(json.dumps(line, default=str) + "\n")
+    _append(phi_airgap_dir() / "log.jsonl", line)
+    _append(home_audit_path(), line)
+
+
+def verify_chain(path: Path) -> tuple[bool, int]:
+    """Walk the hash chain. Returns (ok, first bad line number) — (True, 0) if intact."""
+    if not path.exists():
+        return True, 0
+    prev = ""
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            return False, n
+        if e.get("prev", "") != (_sha(prev) if prev else ""):
+            return False, n
+        prev = raw
+    return True, 0
+
+
+def _strip_prev(raw: str) -> dict:
+    try:
+        e = json.loads(raw)
+    except ValueError:
+        return {}
+    e.pop("prev", None)
+    return e
+
+
+def tails_match() -> bool:
+    """True when the workspace log and its home mirror end on the same entry."""
+    ws, home = _last_line(phi_airgap_dir() / "log.jsonl"), _last_line(home_audit_path())
+    return _strip_prev(ws) == _strip_prev(home)
 
 
 def control_hashes() -> dict[str, str]:
@@ -153,9 +232,10 @@ def control_hashes() -> dict[str, str]:
     return out
 
 
-def last_audit(event: str) -> dict | None:
-    """The most recent audit entry for `event`, from the tail of log.jsonl."""
-    path = phi_airgap_dir() / "log.jsonl"
+def last_audit(event: str, home: bool = False) -> dict | None:
+    """The most recent audit entry for `event`, from the tail of the log
+    (`home=True`: the ~/.phi-airgap/audit/ mirror, which the agent cannot rewrite)."""
+    path = home_audit_path() if home else phi_airgap_dir() / "log.jsonl"
     if not path.exists():
         return None
     for line in reversed(path.read_text().splitlines()[-500:]):
