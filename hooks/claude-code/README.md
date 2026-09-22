@@ -4,19 +4,31 @@
 package at `phi_airgap/data/`. It denies the Bash, Read, Grep, Write and Edit
 tool calls that would put row-grain data into the agent's context — executing a
 query, reading a credential, opening a raw extract — and the writes that would
-rewrite the control plane (the policy/config files, the hook itself,
-`~/.claude/settings.json`). It is the **braces**; the `CLAUDE.md` protocol block
-below is the **belt**.
+rewrite the control plane (the policy/config files, the hook itself, every
+`.claude/settings*.json`, the audit log and its mirror, the query history, the
+bypass file). It is the **braces**; the `CLAUDE.md` protocol block below is the
+**belt**.
+
+**It is a denylist against direct invocation, not a sandbox.** Uninspected
+runtimes exist. The control that holds is the deployment shape in
+[`SECURITY.md`](../../SECURITY.md#required-deployment-shape): the agent's OS
+identity holds no credential and has no route to the warehouse.
 
 Leading wrappers are peeled before the command-position token is judged, so
 `uv run phi-airgap run`, `env python3 -c …`, `timeout 30 databricks …`,
 `bash -c "…"` and `python3 -m phi_airgap.cli run` are all denied like their
-bare forms.
+bare forms. Script files handed to a shell (`bash s.sh`, `./s.sh`, `source
+s.sh`) and heredoc bodies are read and judged as shell code. Interpreter
+payloads (python, node, ruby, perl, php, R — `-c`/`-e` text, heredocs, and the
+script files named) are denied if they mention a warehouse driver, an
+HTTP/socket library, Keychain/keyring access, `subprocess`, the phi-airgap
+internals, or the configured warehouse host.
 
 The hook is standalone and dependency-free: it runs on the system Python with no
 third-party packages. It reads a few scalars from your config (see below), and
-it **fails open by design** — if it crashes, it exits 0 and allows the tool,
-because a broken governance hook must never wedge the agent.
+it **fails closed** — malformed input or a crash exits 2 and the harness
+blocks the tool. Set `hook_fail_open: true` in config to restore the old
+fail-open behaviour on purpose.
 
 ## Install
 
@@ -30,13 +42,16 @@ because a broken governance hook must never wedge the agent.
    chmod +x ~/.claude/hooks/pretool-phi-airgap.py
    ```
 
-2. Give it a config to read. The hook looks at `$PHI_AIRGAP_CONFIG`, else
-   `~/.phi-airgap/config.yml`. It reads only three flat scalars:
+2. Give it a config to read: `~/.phi-airgap/config.yml` (`$PHI_AIRGAP_CONFIG`
+   is honoured only if it points under `~/.phi-airgap/`, or with
+   `PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1`). It reads only three flat scalars:
 
-   - `host` — the warehouse host; direct `curl`/`wget`/`nc` to it is blocked.
+   - `host` — the warehouse host; direct `curl`/`wget`/`nc` to it, and any
+     interpreter payload naming it, is blocked.
    - `readable_keychain_service` — the one Keychain service the agent may read
      (for a credential that reaches no sensitive data, e.g. an issue-tracker
      API key). Empty ⇒ every Keychain read is denied.
+   - `hook_fail_open` — `false` by default.
 
    ```bash
    phi-airgap init   # or copy phi_airgap/data/config.example.yml to ~/.phi-airgap/config.yml
@@ -64,13 +79,17 @@ because a broken governance hook must never wedge the agent.
    ```
 
 4. Verify: `phi-airgap doctor` checks the hook is present, byte-identical to
-   the packaged version, registered, and actually denies `phi-airgap run` when
-   invoked; `phi-airgap selftest` red-teams the packaged hook.
+   the packaged version, registered, actually denies `phi-airgap run` when
+   invoked, fails closed on malformed input, and that no bypass file exists;
+   `phi-airgap selftest` red-teams the packaged hook.
 
 ## Bypass
 
-`PHI_AIRGAP_BYPASS=1` disables the hook for that process. It exists for the human to
-use deliberately. If it is set in the agent's environment, there is no hook.
+The file `~/.phi-airgap/BYPASS` disables the hook while it exists. The human
+creates it deliberately (`touch ~/.phi-airgap/BYPASS`) and removes it after;
+the hook denies the agent creating it, and `phi-airgap doctor` reports it as a
+failure. The old `PHI_AIRGAP_BYPASS` env var is ignored: an env var can be set
+from `.claude/settings.local.json`, which is why that file is protected too.
 
 ## The `CLAUDE.md` protocol block (template)
 

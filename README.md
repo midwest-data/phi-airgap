@@ -33,6 +33,18 @@ reference adapter ships; adding another warehouse is ~30 lines.
 
 ---
 
+## Read this first: the deployment shape
+
+The hook is a denylist, not a sandbox. The control that holds is the OS
+boundary: **the agent runs under its own OS identity** (separate macOS user,
+container, or devcontainer) with **no Keychain entry, no token file and no
+network route to the warehouse**; `phi-airgap run` executes only from the
+human's session. See [`SECURITY.md`](SECURITY.md#required-deployment-shape)
+before the quickstart. Without that shape this is harm reduction against
+careless egress, nothing more.
+
+---
+
 ## Install
 
 ```bash
@@ -58,9 +70,10 @@ $EDITOR ~/.phi-airgap/config.yml ~/.phi-airgap/policy.yml
 phi-airgap doctor        # hook installed, current, and actually denying
 ```
 
-`PHI_AIRGAP_CONFIG` / `PHI_AIRGAP_POLICY` override the `~/.phi-airgap/` paths.
-Without either, the CLI falls back to the packaged examples (and `doctor`
-complains, because an example policy is not a reviewed one).
+`PHI_AIRGAP_CONFIG` / `PHI_AIRGAP_POLICY` may point elsewhere *under*
+`~/.phi-airgap/` (or anywhere with `PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1`, which
+the selftest sets). Without either, the CLI falls back to the packaged examples
+(and `doctor` complains, because an example policy is not a reviewed one).
 
 ---
 
@@ -79,12 +92,16 @@ phi-airgap check .phi-airgap/q.sql
 # 3. Only the human runs this. It gates, executes, scrubs, and writes:
 #      .phi-airgap/out/q.csv   (scrubbed result)
 #      .phi-airgap/out/q.json  (ALLOW/DENY verdict + reasons)
-phi-airgap run .phi-airgap/q.sql
+#      .phi-airgap/out/history/<ts>-<sha8>.{sql,json}  (immutable copy)
+phi-airgap run .phi-airgap/q.sql --purpose "tie out July ED volumes"
 ```
 
 The gate's shape: **`group by` the dimensions you care about, project
 `count(*) as n` plus your aggregates, and read the number.** A row peek is
-denied; an aggregate with a count is allowed.
+denied; an aggregate with a count is allowed. A row whose count is below *k*
+is blanked whole (keys included), dates are allowed only at month/quarter/year
+precision, and `LIMIT`/`HAVING` below *k*, `ROLLUP`, targeted `CASE` inside
+aggregates and mismatched `UNION` branches are denied as existence probes.
 
 ```sql
 -- DENIED: a row peek
@@ -151,6 +168,10 @@ version:
   the gate leaked and the policy needs fixing — treat it as a bug, not a catch.
 - **The gate is only as good as `policy.yml`.** An unclassified relation fails
   closed to RED, but a mis-scoped GREEN carve-out is a hole you opened. Review
-  the policy the way you would review an ACL.
+  the policy the way you would review an ACL, and enumerate every person key
+  into `deny_columns`.
+- **The hook is a denylist.** It fails closed and inspects scripts and
+  interpreter payloads, but uninspected runtimes exist. The deployment shape
+  above is the control.
 
 License: [Apache-2.0](LICENSE).

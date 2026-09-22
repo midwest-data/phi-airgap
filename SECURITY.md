@@ -15,6 +15,27 @@ inference path. The k≥11 suppression plus identifier stripping *approximates*
 HIPAA Safe Harbor; it is **not** an expert determination and not a
 certification.
 
+## Required deployment shape
+
+The hook is a denylist against *direct invocation*. It is not a sandbox, and
+uninspected runtimes exist. The boundary that actually holds is the operating
+system's, so the tool assumes this shape and is not safe without it:
+
+- **The agent runs under its own OS identity** — a separate macOS user, a
+  container, or a devcontainer. That identity has **no Keychain entry** for the
+  warehouse, **no `.databrickscfg` / `.env` / token file**, and **no network
+  route to the warehouse host** (firewall, VPN group, or egress proxy).
+- **`phi-airgap run` executes only from the human's session.** The human's
+  identity holds the credential; the agent's does not. The hook blocking
+  `phi-airgap run` is a guardrail against a careless prompt, not the control.
+- The audit mirror under `~/.phi-airgap/audit/` and the hook config live in the
+  agent's home, protected by the hook; the workspace log is a convenience copy.
+
+If the agent and the human share one OS identity, any script the agent writes
+and runs can read the Keychain and call the warehouse, and no hook rule will
+reliably stop it. In that shape this tool is harm reduction against careless
+egress only. Say so in your risk register.
+
 ## Threat model
 
 **What phi-airgap defends against:** an agent (or a careless prompt) that would pull
@@ -40,34 +61,73 @@ queries, read credentials, or read raw extracts. A human runs `phi-airgap run`.
   `ssn 123-45-6789` at zero in testing. A clean NER pass is not proof of
   anything. When NER *fires*, the gate already leaked — fix the policy.
 - **The hook** enforces the human-runs-the-query rule at the harness level. It
-  is designed to **fail open**: if the hook crashes, it exits 0 and allows the
-  tool, because a broken governance hook must never wedge the agent. That means
-  a hook you have disabled, misconfigured, or crashed is providing no
-  protection — `phi-airgap doctor` checks that it is installed and registered.
-- **`PHI_AIRGAP_BYPASS=1`** disables the hook entirely. It exists for the human to
-  use deliberately; if it is set in the agent's environment, there is no hook.
+  **fails closed**: malformed input or a crash exits 2 and the harness blocks
+  the tool (`hook_fail_open: true` in config restores the old fail-open
+  behaviour, on purpose). It inspects interpreter payloads (python, node, ruby,
+  perl, php, R), script files handed to a shell, and heredoc bodies for a
+  warehouse driver, an HTTP/socket library, Keychain/keyring access,
+  `subprocess`, the phi-airgap internals, or the warehouse host — a denylist,
+  not a sandbox. `phi-airgap doctor` checks that it is installed, registered,
+  current, denies when invoked, and fails closed on garbage.
+- **The bypass** is the file `~/.phi-airgap/BYPASS`. The human creates it
+  deliberately; the hook denies the agent creating it, and `doctor` reports it.
+  The old `PHI_AIRGAP_BYPASS` env var is ignored — an env var can be set from
+  an agent-writable settings file.
 - **The control plane.** The policy is the ACL. The hook denies Bash writers
-  (`sed -i`, `tee`, `cp`, `mv`, `rm`, `>`, `truncate`, `chmod`, editors) and the
-  Write/Edit tools on the policy/config files, the hook itself and
-  `~/.claude/settings.json`. As a belt independent of the hook, `phi-airgap run`
-  records `sha256(policy)` and `sha256(config)` in every audit line and prints a
-  `*** POLICY CHANGED since last run ***` banner when either differs from the
-  previous query. A write routed through an interpreter
-  (`python3 -c "open(...)"`) is not caught; the banner is what catches it.
+  (`sed -i`, `tee`, `cp`, `mv`, `rm`, `>`, `truncate`, `chmod`, `touch`,
+  `mkdir`, editors) and the Write/Edit tools on the policy/config files, the
+  hook itself, every `.claude/settings*.json` (including `settings.local.json`,
+  which can set `env` and `disableAllHooks`), the audit log, its home mirror,
+  the query history and the bypass file. `PHI_AIRGAP_CONFIG` / `PHI_AIRGAP_POLICY`
+  are honoured only under `~/.phi-airgap/` (or with
+  `PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1`, which the selftest sets).
+- **The audit log** is hash-chained (each line carries `sha256` of the previous
+  line) and mirrored to `~/.phi-airgap/audit/<workspace-hash>.jsonl` (mode
+  0600). `phi-airgap run` reads its policy-hash baseline from the mirror and
+  prints `*** POLICY CHANGED since last run ***` when `sha256(policy)` or
+  `sha256(config)` differs. `doctor` verifies both chains and that the two
+  tails agree. A write routed through an interpreter is what this catches.
+  Every run also leaves an immutable `out/history/<ts>-<sha8>.{sql,json}` pair.
+- **GREEN cannot be minted.** GREEN patterns must be fully qualified to schemas
+  the agent cannot write; anything in a `dev_*` schema or a `*_dev` catalog is
+  degraded to AMBER by the gate regardless, and `phi-airgap dbt run/build/
+  seed/snapshot` refuses a model whose target relation classifies GREEN.
+
+## Before use — checklist
+
+- Deploy in the shape above. Everything else assumes it.
+- Enumerate **every re-identifying key** in your warehouse into `deny_columns`
+  (`policy.yml`): patient/person/member/subscriber/account keys, source-system
+  surrogate ids, natural keys. Grouping by one enumerates individuals, and
+  k-anonymity only blanks the row — it cannot know a column is a person key.
+  Rule R14 helps only when the metadata cache carries `row_count` /
+  `distinct_count` (see `meta.build`); without them it is inactive.
+- Run `phi-airgap refresh` so `min`/`max` can be typed and `*` screened; with
+  no cache, `min`/`max` over sensitive data is denied outright.
+- Read every `phi-airgap run` verdict. The human runs the query; the human is
+  the last control. `--purpose` records why.
 
 ## Known residuals
 
 Shapes the layers do not close. Each is a policy or review decision, not a bug
 we intend to fix by adding a rule:
 
-- **`min`/`max` over strings.** `max(free_text_column)` over a group is one row's
-  value. `min`/`max` stay allowed because they are legitimate on timestamps;
-  put free-text and identifier columns in `deny_columns` / `deny_descriptions`.
-  (`collect_list`, `any_value`, `first`, `last`, `mode`, `array_agg`,
-  `string_agg` and friends *are* denied — rule R8.)
 - **Differencing across queries.** Two aggregates that differ by one member
   reveal that member. k-anonymity per query does not defend against this;
-  review the audit log for query sequences over the same grouping.
+  review the audit log (`phi-airgap log`, `out/history/`) for query sequences
+  over the same grouping. R10–R12 close the single-query versions (existence
+  probes, ROLLUP marginals, UNION totals), not the multi-query one.
+- **k counts rows, not persons.** A patient with twelve encounters is one
+  person and passes k=11 on their own. Aggregate at the grain you mean.
+- **The human must read the verdict.** `phi-airgap run` prints ALLOW/DENY,
+  suppression and day-precision-date warnings; nothing stops a human from
+  running a query they should have questioned.
+- **Non-Databricks adapters have no hook coverage** beyond the generic client
+  and library denylist. A warehouse reachable through an uninspected runtime
+  is reachable. The deployment shape is the control.
+- **Uninspected runtimes.** The hook reads python/node/ruby/perl/php/R payloads
+  and shell scripts. Compiled binaries, `make`, `cargo run`, notebooks and
+  anything not in that list are not inspected.
 - **dbt models and macros.** `phi-airgap dbt run` scrubs stdout, but a model or
   macro can `log(run_query(...))` rows into that stdout, and only the scrubber
   (regex floor + NER alarm) stands in the way. Review macros like SQL.
@@ -81,6 +141,25 @@ we intend to fix by adding a rule:
 compromised warehouse, side channels in aggregate statistics beyond the k-anon
 threshold, or a model provider that violates its own retention terms. It does
 not encrypt anything or manage access to the warehouse itself.
+
+## What a BAA gives you that this cannot
+
+This tool exists to let an agent work *near* PHI while a Business Associate
+Agreement with the model provider is being acquired. It never replaces one:
+
+- **A contract.** A BAA binds the provider to HIPAA's Security and Privacy
+  Rules, permitted uses and disclosures, and subcontractor flow-down. Nothing
+  here binds anyone.
+- **Breach notification.** A BAA obliges the provider to report a breach to
+  you within a defined window so you can meet your own notification duties.
+  Without it, a disclosure in a transcript is discovered by you or not at all.
+- **Vendor-side safeguards.** Retention limits, no training on your data,
+  access controls and audit on the provider's side, with the right to verify.
+  This tool controls only what leaves your machine.
+- **Liability and enforcement.** A BAA allocates liability and makes the
+  provider directly accountable to HHS. Without it, an authorized disclosure
+  of PHI to the provider does not exist — the best case here is that nothing
+  was disclosed, which is what the layers try to make true.
 
 ## Responsible disclosure
 
