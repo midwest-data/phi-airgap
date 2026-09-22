@@ -32,6 +32,7 @@ Denied on Bash:
 - reading a credential out of Keychain, EXCEPT the one non-sensitive service
   named by config `readable_keychain_service` (empty by default → all denied)
 - curl/wget/nc against the configured warehouse host
+  (`pq` is the same CLI under its short alias and is judged identically)
 - phi-airgap run / uninstall / adopt, and `phi-airgap refresh` without --offline
 - reading a .env / .envrc / .env.<suffix> with a reader command, and redirecting
   into any of them (.env.example / .env.template / .env.sample stay readable)
@@ -515,7 +516,7 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
         if exe == "dbt" and sub in _DBT_BLOCKED:
             return f"`dbt {sub}` prints result rows and is blocked. " + _PROTOCOL
 
-        if exe == "phi-airgap":
+        if exe in ("phi-airgap", "pq"):  # `pq` is the packaged short alias
             if sub in _PQ_BLOCKED:
                 return (
                     f"`phi-airgap {sub}` is the human's command to run, not yours. " + _PROTOCOL

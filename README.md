@@ -118,6 +118,8 @@ from analytics.core.encounter_fact
 group by entity_name
 ```
 
+`pq` is a packaged short alias for `phi-airgap`; the hook treats both the same
+(see "Setting up a working directory for Claude" below).
 Other commands: `phi-airgap scrub <file>` (run the scrubber over anything before it
 lands in a PR), `phi-airgap dbt run/test` (Keychain token injected, stdout scrubbed,
 `show`/`run-operation` blocked), `phi-airgap doctor` / `phi-airgap selftest` (verify the
@@ -127,6 +129,53 @@ phi-airgap is intact), `phi-airgap log` (the audit trail).
 
 See [`hooks/claude-code/README.md`](hooks/claude-code/README.md) for the
 `settings.json` `PreToolUse` block and the `CLAUDE.md` protocol template.
+
+---
+
+## Setting up a working directory for Claude
+
+Use the `pq` prefix for every broker-managed command in a workspace: `pq run`,
+`pq dbt run`, `pq check`, `pq schema`. It is the same CLI as `phi-airgap`.
+
+```bash
+# once per machine (human)
+uv tool install --python 3.12 'phi-airgap[databricks,ner]'
+pq init                                   # ~/.phi-airgap/{config,policy}.yml, ~/.claude/hooks/, settings.json
+$EDITOR ~/.phi-airgap/config.yml          # host, http_path, network_catalogs
+$EDITOR ~/.phi-airgap/policy.yml          # your catalogs; every person key into deny_columns
+security add-generic-password -a "$USER" -s phi-airgap-databricks-pat -w
+
+# once per working directory (human), from the repo root
+mkdir -p .phi-airgap                      # the workspace dir: q.sql, out/, meta/, log.jsonl
+printf '.phi-airgap/out/\n.phi-airgap/meta/\n' >> .gitignore   # keep log.jsonl in git if you want the audit there
+pq refresh --stats                        # column cache + row/distinct counts (activates rule R14)
+pq doctor                                 # hook current, fails closed, no bypass, chains intact
+```
+
+The workspace is whichever ancestor of the current directory holds a
+`.phi-airgap/` dir (git worktrees get their own), else `default_root` in
+config, else the cwd. Everything the agent reads lives under it:
+`.phi-airgap/q.sql` (its SQL), `.phi-airgap/out/q.{csv,json}` (scrubbed result
+and verdict), `.phi-airgap/meta/columns.json` (schema cache),
+`.phi-airgap/log.jsonl` (audit, mirrored under `~/.phi-airgap/audit/`).
+
+Then paste the protocol block from
+[`hooks/claude-code/README.md`](hooks/claude-code/README.md) into the
+workspace `CLAUDE.md`. The agent's loop becomes:
+
+```bash
+pq schema '*visit*'                       # agent: column names, no network
+pq check .phi-airgap/q.sql                # agent: will it pass the gate?
+pq run .phi-airgap/q.sql --purpose "..."  # HUMAN, typed as `! pq run ...` at the Claude prompt
+pq dbt run --select fct_orders            # agent: token injected, stdout scrubbed, GREEN targets refused
+pq scrub some_file.md                     # agent: before anything lands in a PR
+```
+
+`pq run`, `pq refresh` (without `--offline`), `pq adopt` and `pq uninstall` are
+the human's; the hook denies them to the agent under either name. To scope the
+hook to one project instead of the whole account, put the `PreToolUse` block
+from the hook README in `<repo>/.claude/settings.json` rather than
+`~/.claude/settings.json`; the hook still reads `~/.phi-airgap/config.yml`.
 
 ---
 
