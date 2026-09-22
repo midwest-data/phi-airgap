@@ -30,6 +30,7 @@ databricks = [
 
 [project.scripts]
 phi-airgap = "phi_airgap.cli:main"
+pq = "phi_airgap.cli:main"  # short alias for the broker-managed commands
 
 [build-system]
 requires = ["hatchling"]

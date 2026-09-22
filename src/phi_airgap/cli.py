@@ -566,7 +566,7 @@ def cmd_uninstall(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="phi-airgap", description=BANNER)
+    p = argparse.ArgumentParser(prog=Path(sys.argv[0]).name or "phi-airgap", description=BANNER)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="gate, execute and scrub a .sql file")

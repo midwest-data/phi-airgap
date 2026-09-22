@@ -94,29 +94,32 @@ from `.claude/settings.local.json`, which is why that file is protected too.
 ## The `CLAUDE.md` protocol block (template)
 
 Add a block like this to your workspace `CLAUDE.md` so the agent knows the
-protocol. Adjust catalog names and the tone to your project. Generic wording:
+protocol. `pq` is the packaged short alias for `phi-airgap`; the hook treats
+both the same. Adjust catalog names and the tone to your project. Generic
+wording:
 
 ```markdown
 ## PHI airgap — how data access works here
 
 This workspace touches a warehouse holding sensitive data, and there is no BAA
 covering this model provider. So no row-grain data may reach the model. Data
-access goes through `phi-airgap`, and `~/.claude/hooks/pretool-phi-airgap.py` enforces
-it regardless of what this file says. **This does not make anything compliant.**
+access goes through the `pq` broker, and `~/.claude/hooks/pretool-phi-airgap.py`
+enforces it regardless of what this file says. **This does not make anything
+compliant.**
 
 | Need | Do this |
 |---|---|
-| Column names, types, descriptions | `phi-airgap schema <pattern>` — local cache, no network. **Not a query.** |
-| A number from the warehouse | Write SQL to `.phi-airgap/q.sql`, confirm it passes with `phi-airgap check .phi-airgap/q.sql`, then ask the user to run `! phi-airgap run .phi-airgap/q.sql` |
-| Will my SQL pass the gate? | `phi-airgap check <f.sql>` — the gate only. No network, no credential, no rows. |
+| Column names, types, descriptions | `pq schema <pattern>` — local cache, no network. **Not a query.** |
+| A number from the warehouse | Write SQL to `.phi-airgap/q.sql`, confirm it passes with `pq check .phi-airgap/q.sql`, then ask the user to run `! pq run .phi-airgap/q.sql` |
+| Will my SQL pass the gate? | `pq check <f.sql>` — the gate only. No network, no credential, no rows. |
 | The result | Read `.phi-airgap/out/q.csv` (scrubbed) and `.phi-airgap/out/q.json` (verdict) |
-| A dbt build | `phi-airgap dbt run --select <model>` / `phi-airgap dbt test ...` |
-| Scrub anything before a PR | `phi-airgap scrub <file>` |
-| Check the phi-airgap is intact | `phi-airgap doctor`, `phi-airgap selftest`, `phi-airgap log` |
+| A dbt build | `pq dbt run --select <model>` / `pq dbt test ...` |
+| Scrub anything before a PR | `pq scrub <file>` |
+| Check the airgap is intact | `pq doctor`, `pq selftest`, `pq log` |
 
-The agent **never** executes SQL, reads a credential, or runs `phi-airgap run` /
-`phi-airgap refresh` (without `--offline`) / `phi-airgap adopt` / `phi-airgap uninstall` —
-those are the human's. The hook enforces this.
+The agent **never** executes SQL, reads a credential, or runs `pq run` /
+`pq refresh` (without `--offline`) / `pq adopt` / `pq uninstall` — those are
+the human's. The hook enforces this.
 
 The working shape for any query over sensitive data: **`group by` the dimensions
 you care about, project `count(*) as n` plus your aggregates, and read the
