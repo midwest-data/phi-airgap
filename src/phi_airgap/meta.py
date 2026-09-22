@@ -90,7 +90,40 @@ def _from_information_schema(catalogs: list[str]) -> dict:
     return out
 
 
-def build(manifests: list[Path], offline: bool) -> dict:
+def add_stats(conn, index: dict, keys: list[str], max_columns: int = 60) -> int:
+    """Per-relation `row_count` and per-column `distinct_count`, which activate
+    gate rule R14 (person-key enumeration). One `count(*)`/`count(distinct)`
+    statement per relation — only counts leave the warehouse, never values.
+    Returns the number of relations updated."""
+    from . import run  # local import: keeps `phi-airgap schema` off the connector path
+
+    done = 0
+    for key in keys:
+        cols = sorted(index.get(key, {}).get("columns", {}))[:max_columns]
+        if not cols:
+            continue
+        sql = "select count(*)" + "".join(f", count(distinct `{c}`)" for c in cols) + f" from {key}"
+        try:
+            _, rows = run.fetch(conn, sql, 1)
+        except Exception as e:  # a relation we cannot count is not fatal
+            print(f"phi-airgap: skipping stats for {key}: {type(e).__name__}: {e}")
+            continue
+        if not rows:
+            continue
+        index[key]["row_count"] = rows[0][0]
+        for c, n in zip(cols, rows[0][1:], strict=True):
+            index[key]["columns"][c]["distinct_count"] = n
+        done += 1
+    return done
+
+
+def build(manifests: list[Path], offline: bool, stats: bool = False) -> dict:
+    """Merge manifests and information_schema into one index.
+
+    With `stats`, every relation seen in information_schema also gets
+    `row_count` / per-column `distinct_count` (see add_stats); without them
+    gate rule R14 is inactive.
+    """
     index: dict[str, dict] = {}
     for path in manifests:
         if path.exists():
@@ -101,13 +134,20 @@ def build(manifests: list[Path], offline: bool) -> dict:
                 tgt["columns"].update(v.pop("columns", {}))
                 tgt.update(v)
     if not offline:
-        for k, v in _from_information_schema(network_catalogs()).items():
+        from . import run
+
+        live = _from_information_schema(network_catalogs())
+        for k, v in live.items():
             tgt = index.setdefault(k, {"columns": {}})
             # information_schema is authoritative on type; keep dbt's prose.
             for col, meta in v["columns"].items():
                 cur = tgt["columns"].setdefault(col, {})
                 cur["type"] = meta["type"]
                 cur["description"] = cur.get("description") or meta["description"]
+        if stats and live:
+            with run.connect() as conn:
+                n = add_stats(conn, index, sorted(live))
+            print(f"phi-airgap: row/distinct counts for {n} relations (R14 active)")
     return index
 
 

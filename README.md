@@ -33,6 +33,18 @@ reference adapter ships; adding another warehouse is ~30 lines.
 
 ---
 
+## Read this first: the deployment shape
+
+The hook is a denylist, not a sandbox. The control that holds is the OS
+boundary: **the agent runs under its own OS identity** (separate macOS user,
+container, or devcontainer) with **no Keychain entry, no token file and no
+network route to the warehouse**; `phi-airgap run` executes only from the
+human's session. See [`SECURITY.md`](SECURITY.md#required-deployment-shape)
+before the quickstart. Without that shape this is harm reduction against
+careless egress, nothing more.
+
+---
+
 ## Install
 
 ```bash
@@ -49,14 +61,19 @@ gate and hook have no such constraint, but the project is pinned to one
 supported interpreter for simplicity. If you only need the gate and hook, you
 still need 3.12 to install from this pyproject.
 
-Point `phi-airgap` at your reviewed config and policy (copy the examples):
+Then seed the config, policy and the Claude Code hook in one step, and edit
+the two YAML files (they are the ACL):
 
 ```bash
-cp config.example.yml   ~/.phi-airgap/config.yml   # edit host, http_path, catalogs
-cp policy.example.yml   ~/.phi-airgap/policy.yml   # edit the RED/AMBER/GREEN globs
-export PHI_AIRGAP_CONFIG=~/.phi-airgap/config.yml
-export PHI_AIRGAP_POLICY=~/.phi-airgap/policy.yml
+phi-airgap init          # ~/.phi-airgap/{config,policy}.yml + ~/.claude/hooks/ + settings.json
+$EDITOR ~/.phi-airgap/config.yml ~/.phi-airgap/policy.yml
+phi-airgap doctor        # hook installed, current, and actually denying
 ```
+
+`PHI_AIRGAP_CONFIG` / `PHI_AIRGAP_POLICY` may point elsewhere *under*
+`~/.phi-airgap/` (or anywhere with `PHI_AIRGAP_ALLOW_ENV_OVERRIDE=1`, which
+the selftest sets). Without either, the CLI falls back to the packaged examples
+(and `doctor` complains, because an example policy is not a reviewed one).
 
 ---
 
@@ -65,6 +82,10 @@ export PHI_AIRGAP_POLICY=~/.phi-airgap/policy.yml
 The agent's loop, once the hook is registered (see below):
 
 ```bash
+# 0. (human, once) build the cache; --stats adds row/distinct counts so the gate
+#    can flag person keys the policy missed (rule R14).
+phi-airgap refresh --stats
+
 # 1. Column names, types, descriptions — from a local cache, no network.
 phi-airgap schema '*visit*'
 
@@ -75,12 +96,17 @@ phi-airgap check .phi-airgap/q.sql
 # 3. Only the human runs this. It gates, executes, scrubs, and writes:
 #      .phi-airgap/out/q.csv   (scrubbed result)
 #      .phi-airgap/out/q.json  (ALLOW/DENY verdict + reasons)
-phi-airgap run .phi-airgap/q.sql
+#      .phi-airgap/out/history/<ts>-<sha8>.{sql,json}  (immutable copy)
+phi-airgap run .phi-airgap/q.sql --purpose "tie out July ED volumes"
 ```
 
 The gate's shape: **`group by` the dimensions you care about, project
 `count(*) as n` plus your aggregates, and read the number.** A row peek is
-denied; an aggregate with a count is allowed.
+denied; an aggregate with a count is allowed. A row whose count is below *k*
+is blanked whole (keys included), dates are allowed only at month/quarter/year
+precision, and `LIMIT`/`HAVING` below *k*, `ROLLUP`, targeted predicates
+inside aggregates, aggregates nested in subqueries and mismatched `UNION`
+branches are denied as existence probes. Aggregate once, in the outer SELECT.
 
 ```sql
 -- DENIED: a row peek
@@ -147,6 +173,10 @@ version:
   the gate leaked and the policy needs fixing — treat it as a bug, not a catch.
 - **The gate is only as good as `policy.yml`.** An unclassified relation fails
   closed to RED, but a mis-scoped GREEN carve-out is a hole you opened. Review
-  the policy the way you would review an ACL.
+  the policy the way you would review an ACL, and enumerate every person key
+  into `deny_columns`.
+- **The hook is a denylist.** It fails closed and inspects scripts and
+  interpreter payloads, but uninspected runtimes exist. The deployment shape
+  above is the control.
 
 License: [Apache-2.0](LICENSE).

@@ -6,18 +6,33 @@ on:
   pull_request:
 
 jobs:
-  # Core: the gate + hook + deterministic scrubber. No network, no token, no
-  # heavy deps — installs light and runs fast. `phi-airgap selftest` red-teams the
-  # gate, scrubber and hook (the hook cases subprocess the real hook).
-  core:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e .
+      - run: pip install ruff
+      - run: ruff check src tests
+
+  # Core: the gate + hook + deterministic scrubber. No network, no token, no
+  # heavy deps — installs light and runs fast. `phi-airgap selftest` red-teams the
+  # gate, scrubber and hook (the hook cases subprocess the real hook). macOS is
+  # in the matrix because the Keychain path of `adopt` only runs there.
+  core:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
       - run: phi-airgap selftest
+        working-directory: ${{ runner.temp }}
 
   # NER: adds the Presidio alarm. Heavier (spaCy + en_core_web_lg), so it is a
   # separate job. `phi-airgap selftest` here additionally exercises the NER path.
@@ -28,5 +43,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[ner]'
+      - run: pip install '.[ner]'
       - run: phi-airgap selftest

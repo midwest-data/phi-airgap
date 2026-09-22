@@ -8,9 +8,12 @@ output. Patient/row-grain data never reaches the model.
 from __future__ import annotations
 
 import argparse
+import getpass
+import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -22,8 +25,12 @@ BANNER = "phi-airgap — PHI-airgap query broker. Reduces disclosure risk; not H
 # dbt subcommands that print result rows. Blocked regardless of allow_claude_dbt.
 DBT_BLOCKED = {"show", "run-operation"}
 
-# Where the enforcement hook is expected once installed.
+# Where the enforcement hook is expected once installed, and where it ships from.
 HOOK_INSTALL_PATH = Path.home() / ".claude/hooks/pretool-phi-airgap.py"
+HOOK_PACKAGED = util.DATA / "pretool-phi-airgap.py"
+SETTINGS = Path.home() / ".claude/settings.json"
+HOOK_MATCHER = "Bash|Read|Write|Edit|MultiEdit|Grep"
+HOOK_ENTRY = {"type": "command", "command": f"python3 {HOOK_INSTALL_PATH}"}
 
 
 # --- subcommands -------------------------------------------------------------
@@ -35,7 +42,7 @@ def cmd_run(args) -> int:
     path = Path(args.file)
     if not path.exists():
         util.die(f"{path} not found. The agent writes SQL to .phi-airgap/q.sql.")
-    return run.run_file(path)
+    return run.run_file(path, purpose=args.purpose)
 
 
 def cmd_check(args) -> int:
@@ -51,7 +58,8 @@ def cmd_check(args) -> int:
     if not path.exists():
         util.die(f"{path} not found")
     index = meta.load() if meta.cache_path().exists() else None
-    v = gate.check(path.read_text(), util.policy(), index)
+    sql = path.read_text()
+    v = gate.check(sql, util.policy(), index)
 
     print(f"{'ALLOW' if v.allowed else 'DENY '} [{v.worst}]  {path}")
     for table, level in sorted(v.tables.items()):
@@ -60,8 +68,12 @@ def cmd_check(args) -> int:
         print(f"  - {r}")
     if v.allowed:
         print(f"\nGate only — no data was read. Ask the user to run:  ! phi-airgap run {path}")
-    util.audit(event="check", source=str(path), verdict="ALLOW" if v.allowed else "DENY",
-               classification=v.worst, reasons=v.reasons)
+    util.audit(
+        event="check", source=str(path), verdict="ALLOW" if v.allowed else "DENY",
+        classification=v.worst, reasons=v.reasons, sql=sql.strip(),
+        sql_sha256=hashlib.sha256(sql.encode()).hexdigest(), group_keys=sorted(v.group_keys),
+        user=getpass.getuser(), host=socket.gethostname(),
+    )
     return 0 if v.allowed else 1
 
 
@@ -79,7 +91,9 @@ def cmd_refresh(args) -> int:
     from . import meta
 
     manifests = [Path(p).expanduser() for p in args.manifest] or _default_manifests()
-    index = meta.build(manifests, offline=args.offline)
+    if args.stats and args.offline:
+        util.die("--stats needs the warehouse; drop --offline.")
+    index = meta.build(manifests, offline=args.offline, stats=args.stats)
     if not index:
         util.die("Nothing to cache — no manifest found and no catalog reachable.")
     path = meta.save(index)
@@ -90,7 +104,10 @@ def cmd_refresh(args) -> int:
         draft = util.root() / "policy.draft.yml"
         draft.write_text(meta.draft_policy(index, util.policy()))
         print(f"phi-airgap: review sheet -> {draft}")
-    util.audit(event="refresh", relations=len(index), columns=cols, offline=args.offline)
+    util.audit(
+        event="refresh", relations=len(index), columns=cols, offline=args.offline,
+        stats=args.stats,
+    )
     return 0
 
 
@@ -99,6 +116,66 @@ def _default_manifests() -> list[Path]:
     return sorted(root.glob("*/target/manifest.json")) + sorted(
         root.glob("*/*/target/manifest.json")
     )
+
+
+# dbt subcommands that materialise a relation. Their targets may not be GREEN.
+DBT_WRITES = {"run", "build", "seed", "snapshot"}
+_SELECT_FLAGS = {"--select", "-s", "--models", "-m", "--model"}
+
+
+def _dbt_selectors(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    take = False
+    for a in argv:
+        if a in _SELECT_FLAGS:
+            take = True
+            continue
+        if a.startswith(tuple(f + "=" for f in _SELECT_FLAGS)):
+            out.extend(a.split("=", 1)[1].split())
+            continue
+        if a.startswith("-"):
+            take = False
+            continue
+        if take:
+            out.extend(a.split())
+    return out
+
+
+def _green_dbt_targets(selectors: list[str]) -> list[str]:
+    """Relations a dbt write would materialise that classify GREEN, or the
+    reason the check cannot be made. GREEN is exempt from every aggregation
+    rule, so a relation the agent can build must never be GREEN."""
+    from . import gate, meta
+
+    if not meta.cache_path().exists():
+        util.die("no metadata cache — run `phi-airgap refresh --offline` before `dbt run`.", 1)
+    index = meta.load()
+    pol = util.policy()
+    if not selectors:  # a whole-project run touches every model
+        hits = {k: v for k, v in index.items() if v.get("kind") in ("model", "seed", "snapshot")}
+    else:
+        hits = {}
+        for sel in selectors:
+            name = re.sub(r"^[@+\d]*|[+]\d*$", "", sel)
+            if ":" in name or not name:
+                util.die(
+                    f"selector `{sel}` cannot be resolved to relations — use model names, "
+                    "so each target can be classified.",
+                    1,
+                )
+            found = meta.find(name, index)
+            if not found:
+                util.die(
+                    f"`{sel}` is not in the metadata cache — run `phi-airgap refresh --offline`.",
+                    1,
+                )
+            hits.update(found)
+    green = []
+    for key in hits:
+        cat, sch, tbl = (["", ""] + key.split("."))[-3:]
+        if gate.classify(cat, sch, tbl, pol) == "GREEN":
+            green.append(key)
+    return green
 
 
 def cmd_dbt(args) -> int:
@@ -111,6 +188,12 @@ def cmd_dbt(args) -> int:
         util.die(f"`dbt {sub}` prints result rows and is blocked by the phi-airgap.", 1)
     if not cfg.get("allow_claude_dbt", True) and os.environ.get("CLAUDECODE"):
         util.die("allow_claude_dbt is false in config.yml — the human must run dbt.", 1)
+    if sub in DBT_WRITES and (green := _green_dbt_targets(_dbt_selectors(argv))):
+        util.die(
+            f"`dbt {sub}` would materialise a GREEN relation: {', '.join(green)}. GREEN is "
+            "exempt from aggregation, so the agent may not build it. The human runs this.",
+            1,
+        )
 
     env = dict(os.environ, DATABRICKS_TOKEN=util.keychain_get())
     proc = subprocess.run(
@@ -187,19 +270,53 @@ def cmd_doctor(args) -> int:
     )
 
     print("\nharness hook")
-    check(HOOK_INSTALL_PATH.exists(), f"{HOOK_INSTALL_PATH} exists")
-    settings = Path.home() / ".claude/settings.json"
+    check(HOOK_INSTALL_PATH.exists(), f"{HOOK_INSTALL_PATH} exists", "phi-airgap init")
+    if HOOK_INSTALL_PATH.exists():
+        installed, packaged = _hook_version(HOOK_INSTALL_PATH), _hook_version(HOOK_PACKAGED)
+        check(
+            HOOK_INSTALL_PATH.read_bytes() == HOOK_PACKAGED.read_bytes(),
+            f"installed hook matches packaged (installed {installed}, packaged {packaged})",
+            "phi-airgap init --force-hook",
+        )
+        check(
+            _hook_denies(HOOK_INSTALL_PATH, "phi-airgap run x.sql"),
+            "installed hook denies `phi-airgap run` when actually invoked",
+        )
+        check(
+            _hook_exit(HOOK_INSTALL_PATH, "not json") != 0,
+            "installed hook fails closed on malformed input",
+            "set hook_fail_open: false in config.yml",
+        )
+    bypass = util.HOME_DIR / "BYPASS"
+    check(not bypass.exists(), f"no bypass file at {bypass}", f"rm {bypass}")
     registered = False
-    if settings.exists():
-        registered = "pretool-phi-airgap.py" in settings.read_text()
-    check(registered, "hook registered in ~/.claude/settings.json")
+    if SETTINGS.exists():
+        registered = "pretool-phi-airgap.py" in SETTINGS.read_text()
+    check(registered, f"hook registered in {SETTINGS}", "phi-airgap init")
 
     print("\npolicy + cache")
-    check(util.POLICY_FILE.exists(), f"{util.POLICY_FILE} exists")
+    check(util.POLICY_FILE.exists(), f"policy: {util.POLICY_FILE}")
+    check(
+        util.POLICY_FILE.parent != util.DATA,
+        "policy is a reviewed copy, not the packaged example",
+        "phi-airgap init, then edit ~/.phi-airgap/policy.yml",
+    )
     from . import meta
 
     cache = meta.cache_path()
     check(cache.exists(), f"metadata cache {cache}", "phi-airgap refresh")
+
+    print("\naudit log")
+    ws_log, home_log = util.phi_airgap_dir() / "log.jsonl", util.home_audit_path()
+    for label, path in (("workspace", ws_log), ("home mirror", home_log)):
+        ok, line = util.verify_chain(path)
+        check(ok, f"{label} chain intact: {path}" + ("" if ok else f" (breaks at line {line})"),
+              "the log was edited or truncated — investigate before trusting the banner")
+    check(
+        util.tails_match(),
+        "workspace log and home mirror agree on the last entry",
+        "the workspace log was rewritten; the home mirror is the record",
+    )
 
     print("\nplaintext secrets on disk")
     for path, hits in _scan_secrets(util.root()):
@@ -220,8 +337,37 @@ def cmd_doctor(args) -> int:
     return 1 if problems else 0
 
 
+def _hook_version(path: Path) -> str:
+    m = re.search(r"^# hook-version:\s*(\S+)", path.read_text(errors="replace"), re.M)
+    return m.group(1) if m else "unknown"
+
+
+def _hook_exit(hook: Path, stdin: str) -> int:
+    try:
+        return subprocess.run(
+            [sys.executable, str(hook)], input=stdin, capture_output=True, text=True, timeout=20
+        ).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+
+
+def _hook_denies(hook: Path, command: str) -> bool:
+    """Run the installed hook on one Bash payload; True if it printed a deny."""
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    try:
+        r = subprocess.run(
+            [sys.executable, str(hook)], input=payload, capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return '"deny"' in r.stdout
+
+
 _SECRET_SCAN = re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}")
-_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "target", "__pycache__", ".phi-airgap", "dbt_packages"}
+_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "target", "__pycache__", ".phi-airgap",
+    "dbt_packages",
+}
 
 
 def _scan_secrets(base: Path, limit: int = 40) -> list[tuple[str, str]]:
@@ -249,7 +395,8 @@ _POINTER = (
     "# {key} removed by `phi-airgap adopt` on the PHI phi-airgap.\n"
     "# The value now lives in the macOS Keychain under service `{service}`,\n"
     "# where the agent cannot read it. Run commands through `phi-airgap` (which injects it),\n"
-    "# or in a shell:  export {key}=$(security find-generic-password -a \"$USER\" -s {service} -w)\n"
+    "# or in a shell:\n"
+    "#   export {key}=$(security find-generic-password -a \"$USER\" -s {service} -w)\n"
 )
 
 
@@ -274,7 +421,7 @@ def cmd_adopt(args) -> int:
     secret = m.group(1)
 
     r = subprocess.run(
-        ["security", "add-generic-password", "-U", "-a", os.environ["USER"], "-s", service,
+        ["security", "add-generic-password", "-U", "-a", getpass.getuser(), "-s", service,
          "-w", secret, "-D", "phi-airgap PHI broker", "-j", f"adopted from {path}"],
         capture_output=True, text=True,
     )
@@ -292,7 +439,8 @@ def cmd_adopt(args) -> int:
     print(
         f"phi-airgap: {args.key} -> Keychain service '{service}' (verified)\n"
         f"phi-airgap: {path} rewritten with a pointer comment\n"
-        f"phi-airgap: plaintext backup at {backup} — DELETE IT once you have confirmed things work:\n"
+        f"phi-airgap: plaintext backup at {backup} — DELETE IT once you have confirmed things "
+        "work:\n"
         f"      rm '{backup}'\n"
         f"phi-airgap: this token has appeared in shell history and past transcripts. ROTATE IT."
     )
@@ -303,11 +451,53 @@ def cmd_adopt(args) -> int:
 def cmd_selftest(args) -> int:
     """Run the red-team suite. Exposed as a subcommand so it is runnable without
     naming a .py file that the harness hook (rightly) refuses to execute."""
-    tests_dir = util.REPO_ROOT / "tests"
-    sys.path.insert(0, str(tests_dir))
-    import test_airgap
+    from . import selftest
 
-    return test_airgap.main()
+    return selftest.main()
+
+
+def cmd_init(args) -> int:
+    """Copy the example config/policy to ~/.phi-airgap/ (never overwriting),
+    install the hook, and register it in ~/.claude/settings.json."""
+    import shutil
+
+    util.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    for name in ("config", "policy"):
+        dst = util.HOME_DIR / f"{name}.yml"
+        if dst.exists():
+            print(f"phi-airgap: kept existing {dst}")
+        else:
+            shutil.copy(util.DATA / f"{name}.example.yml", dst)
+            print(f"phi-airgap: wrote {dst} — EDIT IT before use")
+
+    HOOK_INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if HOOK_INSTALL_PATH.exists() and not args.force_hook:
+        if HOOK_INSTALL_PATH.read_bytes() != HOOK_PACKAGED.read_bytes():
+            print(
+                f"phi-airgap: {HOOK_INSTALL_PATH} differs from packaged — rerun with --force-hook"
+            )
+    else:
+        shutil.copy(HOOK_PACKAGED, HOOK_INSTALL_PATH)
+        HOOK_INSTALL_PATH.chmod(0o755)
+        print(f"phi-airgap: installed hook -> {HOOK_INSTALL_PATH}")
+
+    data = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    blocks = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    ours = [
+        b for b in blocks
+        if any("pretool-phi-airgap" in h.get("command", "") for h in b.get("hooks", []))
+    ]
+    if ours and ours[0].get("matcher") == HOOK_MATCHER:
+        print(f"phi-airgap: hook already registered in {SETTINGS}")
+    else:
+        for b in ours:
+            blocks.remove(b)
+        blocks.append({"matcher": HOOK_MATCHER, "hooks": [HOOK_ENTRY]})
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"phi-airgap: registered hook in {SETTINGS} (matcher {HOOK_MATCHER})")
+    util.audit(event="init")
+    return 0
 
 
 def cmd_log(args) -> int:
@@ -323,7 +513,9 @@ def cmd_log(args) -> int:
             continue
         head = f"{e.get('ts', '')}  {e.get('event', ''):<8} {e.get('verdict', ''):<10}"
         detail = e.get("source") or " ".join(map(str, e.get("args", []))) or e.get("file", "")
-        print(f"{head} {detail}")
+        sha = e.get("sql_sha256", "")[:8]
+        who = " ".join(x for x in (sha, e.get("user", ""), e.get("purpose", "")) if x)
+        print(f"{head} {detail}" + (f"  [{who}]" if who else ""))
         for r in e.get("reasons", [])[:3]:
             print(f"    - {r}")
     return 0
@@ -338,7 +530,9 @@ def cmd_uninstall(args) -> int:
         blocks = data.get("hooks", {}).get("PreToolUse", [])
         for block in blocks:
             block["hooks"] = [
-                h for h in block.get("hooks", []) if "pretool-phi-airgap" not in h.get("command", "")
+                h
+                for h in block.get("hooks", [])
+                if "pretool-phi-airgap" not in h.get("command", "")
             ]
         data["hooks"]["PreToolUse"] = [b for b in blocks if b.get("hooks")]
         settings.write_text(json.dumps(data, indent=2))
@@ -377,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="gate, execute and scrub a .sql file")
     r.add_argument("file")
+    r.add_argument("--purpose", help="why this query is being run (recorded in the audit log)")
     r.set_defaults(fn=cmd_run)
 
     k = sub.add_parser("check", help="run the gate on a .sql file without executing it")
@@ -392,6 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--offline", action="store_true", help="dbt manifest only, no warehouse")
     f.add_argument("--manifest", action="append", default=[], help="path to a dbt manifest.json")
     f.add_argument("--draft-policy", action="store_true", help="write policy.draft.yml for review")
+    f.add_argument(
+        "--stats", action="store_true",
+        help="also count rows and distinct values per column (activates gate rule R14; "
+        "one count(*)/count(distinct) statement per relation, can be slow on raw tables)",
+    )
     f.set_defaults(fn=cmd_refresh)
 
     d = sub.add_parser("dbt", help="dbt wrapper: Keychain token, no show/run-operation")
@@ -414,6 +614,12 @@ def main(argv: list[str] | None = None) -> int:
         help="report only, exit 1 if anything would be redacted (no output, no rewrite)",
     )
     c.set_defaults(fn=cmd_scrub)
+
+    i = sub.add_parser(
+        "init", help="copy example config/policy to ~/.phi-airgap and install the hook"
+    )
+    i.add_argument("--force-hook", action="store_true", help="overwrite an existing installed hook")
+    i.set_defaults(fn=cmd_init)
 
     sub.add_parser("doctor", help="verify the phi-airgap is intact").set_defaults(fn=cmd_doctor)
     sub.add_parser("selftest", help="red-team the gate, scrubber and hook").set_defaults(

@@ -2,7 +2,7 @@
 
 Three independent passes:
   1. structural column check  — deterministic, HARD FAIL (nothing is emitted)
-  2. k-anonymity suppression  — small cells become "<11"
+  2. k-anonymity suppression  — a row with a count below k is blanked whole
   3. Presidio NER             — the ALARM. A hit means the gate leaked and the
                                 policy needs fixing; it is not a save.
 
@@ -12,12 +12,17 @@ proof that a result set is PHI-free.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 
 REDACT = "<REDACTED:{}>"
 SUPPRESSED = "<11"
+
+# Names no allow_columns pattern may launder: `*_month` must not admit
+# `birth_month`, `*_year` must not admit `age_year`. Shared with the gate.
+HARD_DENY = re.compile(r"birth|dob|death|^age$|^age_|_age$")
 
 # Deliberately narrow. DATE_TIME and LOCATION are omitted: they fire on every
 # reporting month and every hospital name, and the real Safe Harbor exposures
@@ -110,6 +115,8 @@ class ScrubReport:
     ner_hits: list[dict] = field(default_factory=list)
     day_precision_dates: int = 0
     presidio_ran: bool = False
+    # NER stopped scanning after `budget` characters; the rest was regex-only.
+    ner_budget_exhausted: bool = False
 
     @property
     def alarm(self) -> bool:
@@ -121,6 +128,7 @@ class ScrubReport:
             "cells_suppressed": self.cells_suppressed,
             "rows_suppressed": self.rows_suppressed,
             "presidio_ran": self.presidio_ran,
+            "ner_budget_exhausted": self.ner_budget_exhausted,
             "alarm": self.alarm,
             "regex_hits": self.regex_hits[:50],
             "ner_hits": self.ner_hits[:50],
@@ -158,7 +166,7 @@ def check_columns(
     bad = []
     for col in columns:
         name = col.lower()
-        if any(fnmatch(name, p) for p in allow):
+        if not HARD_DENY.search(name) and any(fnmatch(name, p) for p in allow):
             continue
         for pattern in deny_patterns:
             if fnmatch(name, pattern.lower()):
@@ -194,38 +202,65 @@ def _looks_numeric(rows: list[list], idx: int) -> bool:
     return seen
 
 
+# A group-key cell that is a literal total — the UNION ALL / ROLLUP marginal.
+_TOTAL_CELLS = {"all", "total", "", None}
+
+
 def suppress(
     columns: list[str],
     rows: list[list],
     k: int,
     count_patterns: list[str],
     group_keys: set[str],
+    count_idx: set[int] | None = None,
+    key_idx: set[int] | None = None,
 ) -> tuple[int, int]:
     """k-anonymity suppression, in place. Returns (cells changed, rows hit).
 
-    A row whose count falls below k has its measures suppressed too, not just
-    the count — otherwise a mean or a sum over 3 patients still walks out.
+    A row whose count falls below k is blanked ENTIRELY — group keys included.
+    Blanking only the measures left the keys as a near-unique list (an
+    existence probe: `admit_date, age, '<11'` names a person). Then, if any row
+    was blanked, every marginal row (group keys all literal totals) is blanked
+    too, or the suppressed cell is recoverable by subtraction.
     """
-    count_idx = [i for i, c in enumerate(columns) if _is_count_col(c, count_patterns)]
+    # By name (policy patterns, verdict aliases) AND by output position (the
+    # verdict): an unaliased `count(1)` comes back named whatever the warehouse
+    # chose, and name matching alone silently skipped suppression for it.
+    count_idx = sorted(
+        {i for i, c in enumerate(columns) if _is_count_col(c, count_patterns)}
+        | {i for i in (count_idx or set()) if i < len(columns)}
+    )
     if not count_idx:
         return 0, 0
     keys = {g.lower() for g in group_keys}
-    measure_idx = [
-        i
-        for i, c in enumerate(columns)
-        if c.lower() not in keys and (i in count_idx or _looks_numeric(rows, i))
-    ]
+    key_idx = sorted(
+        {i for i, c in enumerate(columns) if c.lower() in keys}
+        | {i for i in (key_idx or set()) if i < len(columns)}
+    )
+
+    def blank(row: list) -> int:
+        n = 0
+        for i in range(len(row)):
+            if row[i] != SUPPRESSED:
+                row[i] = SUPPRESSED
+                n += 1
+        return n
 
     changed = 0
     hit_rows = 0
     for row in rows:
-        if not any(_small(row[i], k) for i in count_idx):
-            continue
-        hit_rows += 1
-        for i in measure_idx:
-            if row[i] != SUPPRESSED:
-                row[i] = SUPPRESSED
-                changed += 1
+        if any(_small(row[i], k) for i in count_idx):
+            hit_rows += 1
+            changed += blank(row)
+    if hit_rows and key_idx:
+        for row in rows:
+            cells = [row[i] for i in key_idx]
+            if all(
+                c != SUPPRESSED and (c is None or str(c).strip().lower() in _TOTAL_CELLS)
+                for c in cells
+            ):
+                hit_rows += 1
+                changed += blank(row)
     return changed, hit_rows
 
 
@@ -260,6 +295,9 @@ def cell_scan(
     spent = 0
     for r, row in enumerate(rows):
         for c, value in enumerate(row):
+            if isinstance(value, (_dt.date, _dt.datetime)):
+                report.day_precision_dates += 1
+                continue
             if not isinstance(value, str) or len(value) < 3:
                 continue
 
@@ -272,7 +310,10 @@ def cell_scan(
                 value = cleaned
             report.day_precision_dates += len(_DAY_PRECISION_DATE.findall(value))
 
-            if not run_ner or c in ner_skip or _NUMERIC.match(value) or spent > budget:
+            if not run_ner or c in ner_skip or _NUMERIC.match(value):
+                continue
+            if spent > budget:
+                report.ner_budget_exhausted = True
                 continue
             spent += len(value)
             found = _hits(value)
@@ -294,6 +335,8 @@ def scrub(
     k: int = 11,
     require_presidio: bool = True,
     max_suppressed_share: float = 0.5,
+    count_idx: set[int] | None = None,
+    key_idx: set[int] | None = None,
 ) -> ScrubReport:
     report = ScrubReport()
 
@@ -307,18 +350,20 @@ def scrub(
         )
 
     report.cells_suppressed, report.rows_suppressed = suppress(
-        columns, rows, k, count_columns, group_keys or set()
+        columns, rows, k, count_columns, group_keys or set(), count_idx, key_idx
     )
 
-    # A grouping where most cells fall below k is a row dump wearing a GROUP BY.
-    # Suppressing the measures is not enough — the group keys themselves are then
-    # a near-unique list. Refuse the whole result rather than emit the keys.
-    if rows and report.rows_suppressed / len(rows) > max_suppressed_share and len(rows) > 5:
+    # A grouping where most cells fall below k is a row dump wearing a GROUP BY,
+    # and a tiny result with any suppressed row is an existence probe (the
+    # WHERE clause that produced it names the person). Refuse both outright.
+    if rows and (
+        (report.rows_suppressed and len(rows) <= 5)
+        or report.rows_suppressed / len(rows) > max_suppressed_share
+    ):
         raise ScrubFail(
             f"{report.rows_suppressed} of {len(rows)} rows fell below k={k}. That grouping "
-            "is fine-grained enough to be a row dump: suppressing the measures still "
-            "leaves a near-unique list of group keys. Nothing was written — aggregate to "
-            "a coarser grain."
+            "is fine-grained enough to be a row dump or an existence probe. Nothing was "
+            "written — aggregate to a coarser grain."
         )
 
     try:

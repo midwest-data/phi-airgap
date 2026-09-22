@@ -11,7 +11,9 @@ Rules enforced (all deterministic, no heuristics, no model in the loop):
   R2  every output expression over a non-GREEN table is an aggregate or a
       GROUP BY key
   R3  identifier columns may not be referenced anywhere in the statement, and
-      `*` is expanded against the metadata cache before that check runs
+      `*` is expanded against the metadata cache before that check runs; a
+      date-ish denied column is tolerated only inside a month/quarter/year
+      truncation (R13)
   R4  no SELECT DISTINCT over a non-GREEN table (a de-duplicated row dump that
       also carries no count column for k-anonymity to bite on)
   R5  no window functions in the output over a non-GREEN table (they preserve
@@ -20,6 +22,25 @@ Rules enforced (all deterministic, no heuristics, no model in the loop):
       k-anonymity suppression has something to act on
   R7  no LIMIT/OFFSET on a non-aggregated projection — the "peek at 10 rows"
       habit, and paged repetition of it
+  R8  no value-preserving "aggregates" over a non-GREEN table (collect_list,
+      any_value, first, ...) — they return row values, not a statistic; min/max
+      are allowed only over a column the cache types as numeric/date, an
+      allowlisted/count column, or an allowed date truncation
+  R9  no CASE/IF/FILTER inside an aggregate whose predicate names a non-allow
+      column — a targeted count or measure describes one person while the
+      projected count(*) describes the whole table
+  R10 no HAVING that compares a count against a literal below k, and no
+      LIMIT/OFFSET below k on a non-GREEN aggregate — existence probes
+  R11 no ROLLUP / CUBE / GROUPING SETS over non-GREEN — the marginals are
+      complementary-suppression fodder
+  R12 UNION / EXCEPT / INTERSECT over non-GREEN need identical GROUP BY keys in
+      every branch — a `union all select 'ALL', count(*)` marginal is the same
+  R13 see R3
+  R14 when the cache carries row/distinct counts, a non-allow group key whose
+      distinct count is ≥ half the row count is a person key — denied
+  R15 over non-GREEN, aggregate once, in the outer query: an aggregate inside a
+      scalar subquery, derived table or CTE is a targeted count or a marginal
+      that k-anonymity never sees
 """
 
 from __future__ import annotations
@@ -32,10 +53,38 @@ import sqlglot
 from sqlglot import exp
 
 from . import util
+from .scrub import HARD_DENY
 
-# One-value swap: the sqlglot dialect the gate parses and re-serialises in.
-# Read once at import; restart to change it.
-DIALECT = util.config().get("sql_dialect", "databricks")
+
+def dialect() -> str:
+    """The sqlglot dialect the gate parses and re-serialises in (config)."""
+    return util.config().get("sql_dialect", "databricks")
+
+
+# Set per check() call so tests and the selftest do not depend on import order.
+DIALECT = "databricks"
+
+# R8: aggregate functions that return one or more INPUT VALUES rather than a
+# statistic. Over a non-GREEN table they are a row dump wearing GROUP BY.
+_VALUE_AGGS = (
+    exp.ArrayAgg, exp.ArrayUniqueAgg, exp.GroupConcat, exp.AnyValue, exp.First, exp.Last,
+    exp.FirstValue, exp.LastValue, exp.ApproxTopK, exp.Mode, exp.ArgMax, exp.ArgMin,
+)
+_VALUE_AGG_NAMES = {
+    "collect_list", "collect_set", "array_agg", "string_agg", "listagg", "any_value", "first",
+    "last", "first_value", "last_value", "mode", "approx_top_k", "group_concat", "max_by",
+    "min_by", "arg_max", "arg_min",
+}
+# Order statistics return a member of the input set, so they get the min/max
+# typing rule: fine over a number or a date, one row's value over anything else.
+_ORDER_STATS = (
+    exp.Min, exp.Max, exp.PercentileDisc, exp.PercentileCont, exp.Median, exp.Quantile,
+    exp.ApproxQuantile,
+)
+_NUMERIC_OR_DATE_TYPE = re.compile(
+    r"^(?:int|bigint|smallint|tinyint|long|double|float|real|decimal|numeric|date|timestamp)",
+    re.IGNORECASE,
+)
 
 # Only read statements ever reach the warehouse through the broker.
 _ALLOWED_ROOT = (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.Describe, exp.Show)
@@ -55,6 +104,21 @@ _PATH_READ = re.compile(
     re.IGNORECASE,
 )
 
+# R13: a date-ish column name (Safe Harbor: dates finer than a year are
+# identifiers) may appear only inside one of these truncations.
+_DATEISH = re.compile(
+    r"(?:_date$|_dt$|_ts$|_time$|_at$|timestamp|dttm|datetime|^dos$|^dod$|death|admit|discharge"
+    r"|birth|dob)"
+)
+# Birth dates never get the truncation exemption: month of birth is a Safe
+# Harbor identifier and year-of-birth arithmetic yields an age the gate cannot
+# bound. Use a precomputed, reviewed `*_year` column instead.
+_NEVER_TRUNC = re.compile(r"birth|dob")
+_TRUNC_NODES = (exp.Year, exp.Month, exp.Quarter, exp.TimestampTrunc, exp.DateTrunc)
+_TRUNC_UNITS = {"MONTH", "MON", "MM", "QUARTER", "Q", "YEAR", "YY", "YYYY"}
+# Transparent wrappers sqlglot inserts between a column and its truncation.
+_TRANSPARENT = (exp.TsOrDsToDate, exp.Cast, exp.Paren, exp.TimeStrToTime, exp.TsOrDsToTimestamp)
+
 
 @dataclass
 class Verdict:
@@ -65,8 +129,16 @@ class Verdict:
     # Output column names that are GROUP BY keys, not measures. The scrubber
     # needs these to know which cells to blank when a count falls below k.
     group_keys: set[str] = field(default_factory=set)
+    # The same, by output POSITION: the warehouse names an unaliased `count(1)`
+    # however it likes, and the scrubber must still find it.
+    key_idx: set[int] = field(default_factory=set)
+    count_idx: set[int] = field(default_factory=set)
     # True when every referenced relation is GREEN — relaxes the row ceiling.
     all_green: bool = False
+    # Output names whose unaliased expression is a count (count, count_if,
+    # count(*) filter (...), sum(case ... 1 else 0)). The scrubber suppresses
+    # on these regardless of what they were called.
+    count_cols: set[str] = field(default_factory=set)
 
     @property
     def worst(self) -> str:
@@ -81,6 +153,9 @@ class Verdict:
             "classification": self.worst,
             "tables": self.tables,
             "group_keys": sorted(self.group_keys),
+            "count_cols": sorted(self.count_cols),
+            "key_idx": sorted(self.key_idx),
+            "count_idx": sorted(self.count_idx),
             "reasons": self.reasons,
             "sql": self.sql,
         }
@@ -109,7 +184,8 @@ def _variants(catalog: str, schema: str, table: str) -> set[str]:
 
 
 def classify(catalog: str, schema: str, table: str, pol: dict) -> str:
-    forms = _variants(catalog.lower(), schema.lower(), table.lower())
+    catalog, schema, table = catalog.lower(), schema.lower(), table.lower()
+    forms = _variants(catalog, schema, table)
     # red first (fail closed on raw data), then green — the specific, reviewed
     # carve-out list — then amber, the broad catch-all for the mart catalogs.
     # Without green ahead of amber, a broad `analytics.*` amber rule would
@@ -119,6 +195,10 @@ def classify(catalog: str, schema: str, table: str, pol: dict) -> str:
         for pattern in pol.get(level, []) or []:
             p = pattern.lower()
             if any(fnmatch(f, p) for f in forms):
+                # GREEN cannot be minted: anything the agent can write to (a
+                # dev schema, a *_dev catalog) is at most AMBER.
+                if level == "green" and (_DEV_SCHEMA.match(schema) or catalog.endswith("_dev")):
+                    return "AMBER"
                 return level.upper()
     return "RED"  # fail closed: unknown relation is treated as raw PHI
 
@@ -151,15 +231,19 @@ def _tables(tree: exp.Expression) -> tuple[list[tuple[str, str, str]], list[str]
     return named, unnamed
 
 
+def _unwrap(tree: exp.Expression) -> exp.Expression:
+    while isinstance(tree, exp.Subquery):
+        tree = tree.this
+    return tree
+
+
 def _terminal_selects(tree: exp.Expression) -> list[exp.Select]:
     """The SELECTs whose projections actually leave the boundary.
 
     Only the outermost projection is rule-checked: if an inner subquery scans
     raw rows but the outer statement aggregates them, nothing row-grain escapes.
     """
-    node = tree
-    while isinstance(node, exp.Subquery):
-        node = node.this
+    node = _unwrap(tree)
     if isinstance(node, exp.Select):
         return [node]
     if isinstance(node, (exp.Union, exp.Except, exp.Intersect)):
@@ -190,6 +274,35 @@ def _has_window(e: exp.Expression) -> bool:
     return any(isinstance(n, exp.Window) for n in e.walk())
 
 
+def _value_agg(e: exp.Expression) -> str | None:
+    """Name of the first value-preserving aggregate in the expression, if any."""
+    for n in e.walk():
+        if isinstance(n, _VALUE_AGGS):
+            return n.sql_name().lower()
+        if isinstance(n, exp.Anonymous) and n.name.lower() in _VALUE_AGG_NAMES:
+            return n.name.lower()
+    return None
+
+
+def _is_count(e: exp.Expression) -> bool:
+    """A count-shaped aggregate: count, count_if, count(...) filter (where ...),
+    or sum(case when ... then 1 else 0 end) — anything whose value is a number
+    of rows, so that k-anonymity suppression can act on it."""
+    if isinstance(e, (exp.Count, exp.CountIf)):
+        return True
+    if isinstance(e, exp.Filter):
+        return isinstance(e.this, (exp.Count, exp.CountIf))
+    if isinstance(e, exp.Sum) and isinstance(e.this, exp.Case):
+        case = e.this
+        branches = [i.args.get("true") for i in case.args.get("ifs", [])]
+        branches.append(case.args.get("default"))
+        return all(
+            b is None or (isinstance(b, exp.Literal) and not b.is_string and b.name in ("0", "1"))
+            for b in branches
+        )
+    return False
+
+
 def _group_keys(select: exp.Select) -> set[str]:
     group = select.args.get("group")
     if not group:
@@ -215,7 +328,9 @@ def _group_keys(select: exp.Select) -> set[str]:
 
 
 def _column_tokens(tree: exp.Expression) -> set[str]:
-    """Every column-ish name mentioned anywhere in the statement."""
+    """Every column-ish name mentioned anywhere in the statement — including a
+    field pulled out of a map/struct/JSON column, so `attrs['ssn']`,
+    `p.info.ssn` and `get_json_object(p, '$.mrn')` all hit deny_columns."""
     names = set()
     for c in tree.find_all(exp.Column):
         if c.name:
@@ -223,6 +338,20 @@ def _column_tokens(tree: exp.Expression) -> set[str]:
     for a in tree.find_all(exp.Alias):
         if a.alias:
             names.add(a.alias.lower())
+    for b in tree.find_all(exp.Bracket):
+        for lit in b.expressions:
+            if isinstance(lit, exp.Literal) and lit.is_string:
+                names.add(lit.name.lower())
+    for d in tree.find_all(exp.Dot):
+        for ident in d.find_all(exp.Identifier):
+            names.add(ident.name.lower())
+    for k in tree.find_all(exp.JSONPathKey):
+        names.add(str(k.this).lower())
+    for j in tree.find_all(exp.JSONExtract, exp.JSONExtractScalar):
+        path = j.expression
+        if isinstance(path, exp.Literal):
+            names.add(path.name.split(".")[-1].strip("[]'\"").lower())
+    names.discard("")
     return names
 
 
@@ -241,9 +370,9 @@ def _projects_star(tree: exp.Expression) -> bool:
     return False
 
 
-def _cached_columns(tables: list[str], index: dict | None) -> dict[str, tuple[str, str]]:
-    """{column_name: (relation, description)} for every referenced relation."""
-    out: dict[str, tuple[str, str]] = {}
+def _cached_columns(tables: list[str], index: dict | None) -> dict[str, tuple[str, str, str]]:
+    """{column_name: (relation, description, type)} for every referenced relation."""
+    out: dict[str, tuple[str, str, str]] = {}
     if not index:
         return out
     for key in tables:
@@ -257,16 +386,142 @@ def _cached_columns(tables: list[str], index: dict | None) -> dict[str, tuple[st
                 None,
             )
         for name, meta in (entry or {}).get("columns", {}).items():
-            out.setdefault(name.lower(), (key, meta.get("description", "")))
+            out.setdefault(name.lower(), (key, meta.get("description", ""), meta.get("type", "")))
     return out
+
+
+def _cached_entries(tables: list[str], index: dict | None) -> list[dict]:
+    if not index:
+        return []
+    out = []
+    for key in tables:
+        entry = index.get(key)
+        if not entry:
+            tail = key.rsplit(".", 1)[-1]
+            entry = next((v for k, v in index.items() if k.rsplit(".", 1)[-1] == tail), None)
+        if entry:
+            out.append(entry)
+    return out
+
+
+def _only_truncated(tree: exp.Expression, name: str) -> bool:
+    """R13: every reference to column `name` sits inside a month/quarter/year
+    truncation (with at most transparent casts in between)."""
+    if _NEVER_TRUNC.search(name):
+        return False
+    cols = [c for c in tree.find_all(exp.Column) if c.name.lower() == name]
+    if not cols:
+        return False
+    return all(_truncation_of(c) is not None for c in cols)
+
+
+def _truncation_of(col: exp.Column) -> exp.Expression | None:
+    node = col.parent
+    while isinstance(node, _TRANSPARENT):
+        node = node.parent
+    if isinstance(node, (exp.Year, exp.Month, exp.Quarter)):
+        return node
+    if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
+        unit = node.args.get("unit")
+        if unit is not None and unit.name.upper() in _TRUNC_UNITS:
+            return node
+    return None
+
+
+def _predicate_columns(agg: exp.Expression) -> set[str]:
+    """Columns named in a predicate inside an aggregate: CASE/IF/FILTER
+    conditions, and any bare comparison (`sum(cast(sex = 'F' as int))`)."""
+    names: set[str] = set()
+    for n in agg.walk():
+        if isinstance(n, exp.CountIf):  # a count: k-anonymity suppresses it
+            continue
+        preds: list[exp.Expression] = []
+        if isinstance(n, exp.Case):
+            preds = [i.this for i in n.args.get("ifs", [])]
+        elif isinstance(n, exp.If):
+            preds = [n.this]
+        elif isinstance(n, exp.Filter):
+            preds = [n.expression]
+        elif isinstance(n, exp.Predicate) and not _inside(n, exp.CountIf):
+            preds = [n]
+        for p in preds:
+            names |= {c.name.lower() for c in p.find_all(exp.Column) if c.name}
+    return names
+
+
+def _inside(node: exp.Expression, *types) -> bool:
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, types):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _nested_aggregates(tree: exp.Expression) -> list[str]:
+    """R15: aggregates that sit inside a subquery or CTE rather than a terminal select."""
+    out = []
+    for n in tree.find_all(exp.AggFunc):
+        if _in_window(n):
+            continue
+        if _inside(n, exp.Subquery, exp.CTE):
+            out.append(n.sql(dialect=DIALECT)[:60])
+    return out
+
+
+def _small_literal(e: exp.Expression | None, k: int) -> bool:
+    if isinstance(e, exp.Neg):
+        return True
+    if not isinstance(e, exp.Literal) or e.is_string:
+        return False
+    try:
+        return float(e.name) <= k
+    except ValueError:
+        return False
+
+
+def _having_probe(having: exp.Expression, k: int, count_cols: set[str]) -> bool:
+    """HAVING <count> <, <=, = or BETWEEN a literal below k, where <count> is a
+    count expression, arithmetic over one, or the alias of a count column."""
+
+    def countish(e: exp.Expression | None) -> bool:
+        if e is None:
+            return False
+        return any(
+            _is_count(n) or (isinstance(n, exp.Column) and n.name.lower() in count_cols)
+            for n in e.walk()
+        )
+
+    for n in having.walk():
+        if isinstance(n, (exp.LT, exp.LTE, exp.EQ)):
+            a, b = n.this, n.expression
+            if (countish(a) and _small_literal(b, k)) or (countish(b) and _small_literal(a, k)):
+                return True
+        if isinstance(n, exp.GT | exp.GTE):
+            a, b = n.this, n.expression
+            if _small_literal(a, k) and countish(b):  # `3 > count(*)`
+                return True
+        if isinstance(n, exp.Between) and countish(n.this):
+            if _small_literal(n.args.get("low"), k):
+                return True
+    return False
 
 
 # --- the gate ----------------------------------------------------------------
 
 
-def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
+def check(
+    sql: str,
+    pol: dict,
+    index: dict | None = None,
+    dialect_name: str | None = None,
+    k: int | None = None,
+) -> Verdict:
     """Classify and rule-check a statement. `index` is the metadata cache; when
     supplied, `*` is expanded and column descriptions are screened too."""
+    global DIALECT
+    DIALECT = dialect_name or dialect()
+    k = k if k is not None else int(util.config().get("k_threshold", 11))
     v = Verdict(allowed=False, sql=sql.strip())
 
     # R0 — parseable, single, read-only.
@@ -288,7 +543,8 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
     tree = statements[0]
     if not isinstance(tree, _ALLOWED_ROOT):
         v.reasons.append(
-            f"{type(tree).__name__.upper()} is not permitted — phi-airgap is read-only, SELECT only."
+            f"{type(tree).__name__.upper()} is not permitted — phi-airgap is read-only, "
+            "SELECT only."
         )
         return v
 
@@ -309,24 +565,34 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
     for cat, sch, tbl in named:
         v.tables[".".join(p for p in (cat, sch, tbl) if p)] = classify(cat, sch, tbl, pol)
 
-    sensitive = {k: lvl for k, lvl in v.tables.items() if lvl != "GREEN"}
+    sensitive = {k_: lvl for k_, lvl in v.tables.items() if lvl != "GREEN"}
     v.all_green = bool(v.tables) and not sensitive
 
     # Group keys, for the scrubber. By construction of R2 below, any output
     # expression that is not an aggregate must be a GROUP BY key.
     for select in _terminal_selects(tree):
-        for e in select.expressions:
+        for i, e in enumerate(select.expressions):
             inner = e.unalias() if isinstance(e, exp.Alias) else e
             if not _has_aggregate(inner):
                 v.group_keys.add((e.alias_or_name or "").lower())
+                v.key_idx.add(i)
+            elif _is_count(inner):
+                v.count_cols.add((e.alias_or_name or "").lower())
+                v.count_idx.add(i)
     v.group_keys.discard("")
+    v.count_cols.discard("")
 
     # R3 — identifier columns, anywhere in the statement. `*` is expanded from
     # the metadata cache first, so `select * from a_green_table` is screened on
     # its real columns rather than waved through.
     denied_cols = pol.get("deny_columns", []) or []
     allowed_cols = [p.lower() for p in pol.get("allow_columns", []) or []]
+    count_pats = [p.lower() for p in pol.get("count_columns", []) or []]
     denied_desc = [p.lower() for p in pol.get("deny_descriptions", []) or []]
+
+    def is_allowed(name: str) -> bool:
+        # allow_columns wins, except for names no allowlist may launder.
+        return not HARD_DENY.search(name) and any(fnmatch(name, p) for p in allowed_cols)
 
     referenced = _column_tokens(tree)
     cached = _cached_columns(list(v.tables), index)
@@ -340,20 +606,31 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
         )
 
     for name in sorted(referenced):
-        if any(fnmatch(name, p) for p in allowed_cols):
+        if is_allowed(name):
             continue
         hit = next((p for p in denied_cols if fnmatch(name, p.lower())), None)
         if hit:
+            # R13 — a date-ish column survives the denylist only inside an
+            # allowed truncation: `date_trunc('month', admit_ts)` is a reporting
+            # period, `admit_ts` and `date_trunc('hour', admit_ts)` are not.
+            if _DATEISH.search(name) and _only_truncated(tree, name):
+                continue
             v.reasons.append(
                 f"Column `{name}` matches denied pattern `{hit}` — direct and quasi "
                 "identifiers may not be referenced anywhere in the query (SELECT, WHERE, "
                 "JOIN, HAVING or ORDER BY)."
+                + (
+                    " Date columns are allowed only as `date_trunc('month'|'quarter'|'year', "
+                    "col)`, `year(col)` or `month(col)`."
+                    if _DATEISH.search(name)
+                    else ""
+                )
             )
             continue
         # Screen the warehouse/model description too: it catches identifier
         # columns whose *name* is opaque (pat_nm, ptnt_1) but whose documented
         # meaning is not.
-        desc = cached.get(name, ("", ""))[1].lower()
+        desc = cached.get(name, ("", "", ""))[1].lower()
         if desc and (bad := next((p for p in denied_desc if fnmatch(desc, p)), None)):
             v.reasons.append(
                 f"Column `{name}` is described as {desc[:80]!r}, which matches denied "
@@ -365,6 +642,29 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
         selects = _terminal_selects(tree)
         if not selects:
             v.reasons.append("Could not resolve the output projection — denying.")
+
+        # R15 — aggregate once, in the outer query. A count inside a scalar
+        # subquery or a derived table is a targeted count or a marginal that the
+        # scrubber never sees as a count.
+        if nested := _nested_aggregates(tree):
+            v.reasons.append(
+                f"Aggregate inside a subquery/CTE over {listing}: {', '.join(nested[:3])}. "
+                "Nested aggregates are targeted counts or marginals that k-anonymity cannot "
+                "suppress. Aggregate once, in the outer SELECT."
+            )
+
+        # R12 — set operations must agree on their grouping, or one branch is
+        # the other's marginal.
+        root = _unwrap(tree)
+        if isinstance(root, (exp.Union, exp.Except, exp.Intersect)):
+            keysets = [frozenset(_group_keys(s)) for s in selects]
+            if len(set(keysets)) > 1:
+                v.reasons.append(
+                    f"{type(root).__name__.upper()} over {listing} with differing GROUP BY "
+                    "keys across branches is denied: one branch is a marginal of the other, "
+                    "and a suppressed cell can be recovered by subtraction. Give every "
+                    "branch the identical GROUP BY."
+                )
 
         for select in selects:
             keys = _group_keys(select)
@@ -378,6 +678,13 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
                     "GROUP BY instead."
                 )
 
+            # R11 — ROLLUP / CUBE / GROUPING SETS emit the marginals.
+            if select.find(exp.Rollup, exp.Cube, exp.GroupingSets):
+                v.reasons.append(
+                    f"ROLLUP/CUBE/GROUPING SETS over {listing} is denied: the subtotal rows "
+                    "let a suppressed cell be recovered by subtraction."
+                )
+
             for e in select.expressions:
                 if isinstance(e, exp.Star) or (
                     isinstance(e, exp.Column) and isinstance(e.this, exp.Star)
@@ -388,25 +695,69 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
                     )
                     continue
                 inner = e.unalias() if isinstance(e, exp.Alias) else e
+                text = e.sql(dialect=DIALECT)
 
                 # R5 — window functions preserve row count.
                 if _has_window(inner):
                     v.reasons.append(
-                        f"Output expression `{e.sql(dialect=DIALECT)}` uses a window "
-                        f"function over {listing}. Windows return one row per input row, "
-                        "so they are not aggregation."
+                        f"Output expression `{text}` uses a window function over {listing}. "
+                        "Windows return one row per input row, so they are not aggregation."
+                    )
+                    continue
+                # R8 — value-preserving aggregates return row values.
+                if fn := _value_agg(inner):
+                    v.reasons.append(
+                        f"Output expression `{text}` uses `{fn}` over {listing}, which "
+                        "returns individual row values, not a statistic."
                     )
                     continue
                 if _has_aggregate(inner):
+                    # R8 — min/max return one row's value unless the column is
+                    # a number or a date.
+                    for mm in inner.find_all(*_ORDER_STATS):
+                        arg = mm.this
+                        ok = False
+                        if isinstance(arg, exp.Column):
+                            n = arg.name.lower()
+                            ctype = cached.get(n, ("", "", ""))[2]
+                            ok = (
+                                is_allowed(n)
+                                or any(fnmatch(n, p) for p in count_pats)
+                                or bool(_NUMERIC_OR_DATE_TYPE.match(ctype))
+                            )
+                        elif isinstance(arg, _TRUNC_NODES):
+                            ok = True
+                        if not ok:
+                            why = (
+                                "no metadata cache — ask the user to run `phi-airgap refresh`"
+                                if not cached
+                                else "the cache does not type it as numeric/date"
+                            )
+                            v.reasons.append(
+                                f"`{text}`: {mm.sql_name().lower()} over {listing} returns one "
+                                "row's value. "
+                                f"Allowed only over a column typed numeric/date ({why}), an "
+                                "allow_columns/count column, or a month/quarter/year truncation."
+                            )
+                            break
+                    # R9 — a targeted predicate inside an aggregate.
+                    pred_cols = {c for c in _predicate_columns(inner) if not is_allowed(c)}
+                    if pred_cols:
+                        v.reasons.append(
+                            f"`{text}`: CASE/IF/FILTER inside an aggregate names "
+                            f"{', '.join(sorted(pred_cols))}, so it describes the rows matching "
+                            "that predicate while the projected count describes the whole "
+                            "group. Project `count_if(<pred>) as n` and filter in WHERE instead."
+                        )
                     continue
-                text = inner.sql(dialect=DIALECT).lower()
-                if text in keys or (isinstance(inner, exp.Column) and inner.name.lower() in keys):
+                low = inner.sql(dialect=DIALECT).lower()
+                if low in keys or (isinstance(inner, exp.Column) and inner.name.lower() in keys):
                     continue
                 if isinstance(inner, exp.Literal):
                     continue
                 v.reasons.append(
-                    f"Output expression `{e.sql(dialect=DIALECT)}` is neither an aggregate "
-                    f"nor a GROUP BY key, and the query reads {listing}."
+                    f"Output expression `{text}` is neither an aggregate nor a GROUP BY key, "
+                    f"and the query reads {listing}."
                 )
 
             aggregated = any(_has_aggregate(e) for e in select.expressions)
@@ -424,33 +775,65 @@ def check(sql: str, pol: dict, index: dict | None = None) -> Verdict:
 
             # R6 — k-anonymity needs a count to act on. Without one, an
             # `avg(los_days)` over a group of three is three patients' data.
-            if aggregated and not _projects_count(select, pol):
+            if aggregated and not _projects_count(select):
                 v.reasons.append(
-                    f"No count-like output column, so k-anonymity suppression cannot "
-                    f"apply to this aggregate over {listing}. Add `count(*) as n` (or "
-                    "another column matching policy.yml count_columns) so small cells "
-                    "can be suppressed."
+                    f"No bare `count(...)` output column, so k-anonymity suppression cannot "
+                    f"apply to this aggregate over {listing}. Add `count(*) as n` so small "
+                    "cells can be suppressed (an arithmetic count like `count(*) * 100` "
+                    "does not qualify)."
                 )
 
+            limit, offset = select.args.get("limit"), select.args.get("offset")
             # R7 — the "let me just peek at 10 rows" habit, and paging it.
-            if (select.args.get("limit") or select.args.get("offset")) and not aggregated:
+            if (limit or offset) and not aggregated:
                 v.reasons.append(
                     "LIMIT/OFFSET on a non-aggregated projection is denied outright. To "
                     "inspect a join, use `count(*) ... GROUP BY <join keys>` instead of "
                     "peeking at rows."
                 )
+            # R10 — existence probes: a tiny LIMIT or a HAVING that selects
+            # small cells emits identifying group keys with `<k` beside them.
+            if aggregated:
+                for node in (limit, offset):
+                    if node is not None and _small_literal(node.expression, k):
+                        v.reasons.append(
+                            f"LIMIT/OFFSET below k={k} on an aggregate over {listing} is an "
+                            "existence probe: it returns a handful of group keys with their "
+                            "counts suppressed. Drop the LIMIT or raise it to at least k."
+                        )
+                having = select.args.get("having")
+                if having is not None and _having_probe(having, k, v.count_cols):
+                    v.reasons.append(
+                        f"HAVING that selects counts below k={k} over {listing} is an "
+                        "existence probe: the surviving group keys identify the small cells."
+                    )
+
+            # R14 — a group key that is (nearly) unique per row is a person
+            # key, whatever it is called. Needs row/distinct counts in the cache.
+            for entry in _cached_entries(list(sensitive), index):
+                rc = entry.get("row_count")
+                if not rc:
+                    continue
+                for key in keys:
+                    col = entry.get("columns", {}).get(key, {})
+                    dc = col.get("distinct_count")
+                    if dc and not is_allowed(key) and dc >= 0.5 * rc:
+                        v.reasons.append(
+                            f"Group key `{key}` has {dc} distinct values over {rc} rows in the "
+                            "cache — that is a person key, and grouping by it enumerates "
+                            "individuals. Add it to deny_columns."
+                        )
 
     v.allowed = not v.reasons
     return v
 
 
-def _projects_count(select: exp.Select, pol: dict) -> bool:
-    patterns = [p.lower() for p in pol.get("count_columns", []) or []]
-    for e in select.expressions:
-        name = (e.alias_or_name or "").lower()
-        if name and any(fnmatch(name, p) for p in patterns):
-            return True
-        inner = e.unalias() if isinstance(e, exp.Alias) else e
-        if any(isinstance(n, exp.Count) for n in inner.walk()):
-            return True
-    return False
+def _projects_count(select: exp.Select) -> bool:
+    """At least one projection is a bare count (not `count(*) * 100`).
+
+    Name matching against policy count_columns is deliberately NOT done here:
+    `count(*) * 100 as n` defeats k-anon while wearing a count-like name.
+    """
+    return any(
+        _is_count(e.unalias() if isinstance(e, exp.Alias) else e) for e in select.expressions
+    )
