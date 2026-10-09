@@ -247,6 +247,179 @@ def cmd_scrub(args) -> int:
     return 1 if (args.check and det) else 0
 
 
+# --- pq git: PHI screen for commits and pushes --------------------------------
+
+_GIT_HOOK_MARK = "# phi-airgap git hook v1"
+_GIT_HOOKS = {
+    "pre-commit": "exec pq git scan --staged --no-ner",  # fast: regex floor only
+    "pre-push": "exec pq git scan --pre-push",  # NER advisory on; commit messages too
+}
+
+
+def _git_hook_body(name: str) -> str:
+    return (
+        f"#!/bin/sh\n{_GIT_HOOK_MARK} — do not edit; `pq git uninstall` removes it\n"
+        f"{_GIT_HOOKS[name]} \"$@\"\n"
+    )
+
+
+def _is_our_git_hook(path: Path) -> bool:
+    try:
+        return _GIT_HOOK_MARK in path.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def cmd_git_scan(args) -> int:
+    from . import gitscan
+
+    try:
+        root = gitscan.repo_root()
+    except RuntimeError as e:
+        util.die(str(e))
+    globs = gitscan.load_ignore(root)
+    run_ner = not args.no_ner
+    allow_unscannable = args.allow_unscannable or not util.config().get(
+        "git_unscannable_blocks", True
+    )
+
+    # (path, bytes-loader) pairs plus any commit messages to scan as text.
+    targets: list[tuple[str, object]] = []
+    messages: list[tuple[str, str]] = []
+    try:
+        if args.pre_push:
+            for revs, tip in gitscan.push_ranges(sys.stdin.read()):
+                label = " ".join(revs)
+                targets += [(p, (lambda p=p, tip=tip: gitscan.commit_blob(tip, p)))
+                            for p in gitscan.range_files(revs)]
+                messages.append((f"<commit messages {label}>", gitscan.range_messages(revs)))
+        elif args.range:
+            if ".." not in args.range:
+                util.die("--range takes A..B")
+            tip = args.range.split("..")[-1]
+            targets += [(p, (lambda p=p: gitscan.commit_blob(tip, p)))
+                        for p in gitscan.range_files([args.range])]
+            messages.append((f"<commit messages {args.range}>",
+                             gitscan.range_messages([args.range])))
+        elif args.all:
+            targets += [(p, (lambda p=p: (root / p).read_bytes())) for p in gitscan.all_files()]
+        elif args.paths:
+            targets += [(p, (lambda p=p: Path(p).read_bytes())) for p in args.paths]
+        else:
+            targets += [(p, (lambda p=p: gitscan.staged_blob(p))) for p in gitscan.staged_files()]
+    except RuntimeError as e:
+        util.die(str(e))
+
+    results: list[gitscan.FileResult] = []
+    for path, load in targets:
+        if gitscan.ignored(path, globs):
+            continue
+        try:
+            data = load()
+        except (OSError, RuntimeError) as e:
+            results.append(gitscan.FileResult(path, unscannable=f"unreadable: {e}"))
+            continue
+        results.append(gitscan.scan_blob(path, data, run_ner=run_ner))
+    for label, text in messages:
+        if text.strip():
+            results.append(gitscan.scan_text(label, text, run_ner=run_ner))
+
+    det = sorted({k for r in results for _, kinds in r.hits for k in kinds})
+    ner = sorted({k for r in results for k in r.ner})
+    unscannable = [r for r in results if r.unscannable]
+    blocked = bool(det) or (bool(unscannable) and not allow_unscannable) or (
+        args.strict and bool(ner)
+    )
+
+    if args.json:
+        print(json.dumps([r.__dict__ for r in results]))
+    err = sys.stderr
+    for r in results:
+        for no, kinds in r.hits:
+            print(f"phi-airgap: {r.path}:{no}  {', '.join(kinds)}", file=err)
+        if r.ner:
+            print(f"phi-airgap: advisory: {r.path}  possible {', '.join(r.ner)}", file=err)
+        if r.unscannable:
+            print(f"phi-airgap: unscannable: {r.path}  {r.unscannable}", file=err)
+    n_hit = sum(1 for r in results if r.hits)
+    print(
+        f"phi-airgap: git scan: {len(results)} file(s), {n_hit} with identifiers, "
+        f"{len(unscannable)} unscannable"
+        + (f", possible names in {sum(1 for r in results if r.ner)}" if ner else ""),
+        file=err,
+    )
+    if blocked:
+        print(
+            "phi-airgap: blocked — a false positive? put `phi-airgap: allow` on that line "
+            f"(or `phi-airgap: allow-file` in the first 20 lines), or add a glob to "
+            f"{gitscan.IGNORE_FILE}. Unscannable files: --allow-unscannable for one run.",
+            file=err,
+        )
+    util.audit(
+        event="git-scan", files=len(results), identifiers=det, names=ner,
+        unscannable=[r.path for r in unscannable], blocked=blocked,
+    )
+    return 1 if blocked else 0
+
+
+def cmd_git_install(args) -> int:
+    from . import gitscan
+
+    try:
+        hooks = gitscan.hooks_dir()
+    except RuntimeError as e:
+        util.die(str(e))
+    hooks.mkdir(parents=True, exist_ok=True)
+    for name in _GIT_HOOKS:
+        dst = hooks / name
+        if dst.exists() and not _is_our_git_hook(dst):
+            if not args.force:
+                util.die(
+                    f"{dst} exists and is not ours. Chain it yourself, or rerun with --force "
+                    f"(backs it up to {name}.bak)."
+                )
+            dst.rename(dst.with_name(f"{name}.bak"))
+            print(f"phi-airgap: backed up existing {name} -> {name}.bak")
+        dst.write_text(_git_hook_body(name))
+        dst.chmod(0o755)
+        print(f"phi-airgap: installed {dst}")
+    print(
+        "phi-airgap: commits and pushes are now screened. History before today was not — "
+        "run `pq git scan --all` once."
+    )
+    util.audit(event="git-install", hooks=str(hooks))
+    return 0
+
+
+def cmd_git_uninstall(args) -> int:
+    from . import gitscan
+
+    try:
+        hooks = gitscan.hooks_dir()
+    except RuntimeError as e:
+        util.die(str(e))
+    for name in _GIT_HOOKS:
+        dst = hooks / name
+        if dst.exists() and _is_our_git_hook(dst):
+            dst.unlink()
+            print(f"phi-airgap: removed {dst}")
+        elif dst.exists():
+            print(f"phi-airgap: left {dst} alone (not ours)")
+    util.audit(event="git-uninstall", hooks=str(hooks))
+    return 0
+
+
+def _git_hooks_installed() -> bool | None:
+    """True/False for the cwd's repo, None when cwd is not a git repo."""
+    from . import gitscan
+
+    try:
+        hooks = gitscan.hooks_dir()
+    except RuntimeError:
+        return None
+    return all(_is_our_git_hook(hooks / n) for n in _GIT_HOOKS)
+
+
 def cmd_doctor(args) -> int:
     cfg = util.config()
     problems = 0
@@ -289,6 +462,9 @@ def cmd_doctor(args) -> int:
         )
     bypass = util.HOME_DIR / "BYPASS"
     check(not bypass.exists(), f"no bypass file at {bypass}", f"rm {bypass}")
+    if (git_hooks := _git_hooks_installed()) is not None:
+        check(git_hooks, "git pre-commit/pre-push PHI screen installed in this repo",
+              "pq git install")
     registered = False
     if SETTINGS.exists():
         registered = "pretool-phi-airgap.py" in SETTINGS.read_text()
@@ -611,9 +787,34 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument(
         "--check",
         action="store_true",
-        help="report only, exit 1 if anything would be redacted (no output, no rewrite)",
+        help="report only; exit 1 on identifier matches, names are advisory (no rewrite)",
     )
     c.set_defaults(fn=cmd_scrub)
+
+    gi = sub.add_parser("git", help="PHI screen for commits and pushes (hooks + scanner)")
+    gsub = gi.add_subparsers(dest="git_cmd", required=True)
+    gs = gsub.add_parser(
+        "scan", help="screen files for identifiers; default: the staged files"
+    )
+    gs.add_argument("paths", nargs="*", help="worktree files (what pre-commit.com passes)")
+    gs.add_argument("--staged", action="store_true", help="the index (default)")
+    gs.add_argument("--range", help="commits A..B: files changed, at B, plus the messages")
+    gs.add_argument("--pre-push", action="store_true", help="read the pre-push hook's stdin")
+    gs.add_argument("--all", action="store_true", help="every tracked file")
+    gs.add_argument("--strict", action="store_true", help="possible names (NER) also block")
+    gs.add_argument("--no-ner", action="store_true", help="regex floor only (fast)")
+    gs.add_argument(
+        "--allow-unscannable", action="store_true",
+        help="do not block on files whose text cannot be extracted",
+    )
+    gs.add_argument("--json", action="store_true", help="machine-readable results on stdout")
+    gs.set_defaults(fn=cmd_git_scan)
+    gin = gsub.add_parser("install", help="write pre-commit + pre-push hooks into this repo")
+    gin.add_argument("--force", action="store_true", help="replace foreign hooks (kept as .bak)")
+    gin.set_defaults(fn=cmd_git_install)
+    gsub.add_parser("uninstall", help="remove the hooks this tool wrote").set_defaults(
+        fn=cmd_git_uninstall
+    )
 
     i = sub.add_parser(
         "init", help="copy example config/policy to ~/.phi-airgap and install the hook"

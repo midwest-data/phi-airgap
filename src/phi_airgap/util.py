@@ -74,6 +74,9 @@ DEFAULT_CONFIG = {
     # The hook fails CLOSED on malformed input or a crash (exit 2). Flip to true
     # to fail open (the pre-1.2 behaviour).
     "hook_fail_open": False,
+    # `pq git scan`: a file whose text cannot be extracted (legacy .doc, a PDF
+    # without the [pdf] extra, >20 MB) blocks the commit. False = warn only.
+    "git_unscannable_blocks": True,
 }
 
 

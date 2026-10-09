@@ -1,6 +1,6 @@
 [project]
 name = "phi-airgap"
-version = "1.0.0"
+version = "1.1.0"
 description = "PHI-airgap query broker for LLM coding agents: a deterministic SQL gate, a three-pass scrubber, and an enforcement hook that keep sensitive rows out of the model's context."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -26,6 +26,10 @@ ner = [
 # src/phi_airgap/adapters/__init__.py) if you are not on Databricks.
 databricks = [
     "databricks-sql-connector>=4.0",
+]
+# `pq git scan` reads .pdf text with this; without it PDFs are unscannable and block.
+pdf = [
+    "pypdf>=4",
 ]
 
 [project.scripts]

@@ -115,10 +115,12 @@ compliant.**
 | The result | Read `.phi-airgap/out/q.csv` (scrubbed) and `.phi-airgap/out/q.json` (verdict) |
 | A dbt build | `pq dbt run --select <model>` / `pq dbt test ...` |
 | Scrub anything before a PR | `pq scrub <file>` |
+| Commit / push | Normally. The git hooks screen every commit and push for PHI; a finding means stop and report it. **Never `--no-verify`**, never add a `phi-airgap: allow` marker yourself. |
 | Check the airgap is intact | `pq doctor`, `pq selftest`, `pq log` |
 
 The agent **never** executes SQL, reads a credential, or runs `pq run` /
-`pq refresh` (without `--offline`) / `pq adopt` / `pq uninstall` — those are
+`pq refresh` (without `--offline`) / `pq adopt` / `pq uninstall` /
+`pq git uninstall` — those are
 the human's. The hook enforces this.
 
 The working shape for any query over sensitive data: **`group by` the dimensions

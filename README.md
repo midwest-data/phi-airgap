@@ -121,9 +121,10 @@ group by entity_name
 `pq` is a packaged short alias for `phi-airgap`; the hook treats both the same
 (see "Setting up a working directory for Claude" below).
 Other commands: `phi-airgap scrub <file>` (run the scrubber over anything before it
-lands in a PR), `phi-airgap dbt run/test` (Keychain token injected, stdout scrubbed,
-`show`/`run-operation` blocked), `phi-airgap doctor` / `phi-airgap selftest` (verify the
-phi-airgap is intact), `phi-airgap log` (the audit trail).
+lands in a PR), `phi-airgap git install|scan` (screen every commit and push for
+identifiers, see below), `phi-airgap dbt run/test` (Keychain token injected, stdout
+scrubbed, `show`/`run-operation` blocked), `phi-airgap doctor` / `phi-airgap selftest`
+(verify the phi-airgap is intact), `phi-airgap log` (the audit trail).
 
 ### Registering the Claude Code hook
 
@@ -179,6 +180,58 @@ from the hook README in `<repo>/.claude/settings.json` rather than
 
 ---
 
+## Git hooks: screen commits and pushes
+
+The gate keeps rows out of the transcript; nothing above keeps a file that
+already holds them (a CSV extract, a pasted log, a .docx) out of GitHub.
+`pq git` runs the scrubber's deterministic layer over every staged file at
+commit time and over every outbound commit, including its message, at push time.
+
+```bash
+cd <repo> && pq git install        # writes .git/hooks/pre-commit + pre-push (honours core.hooksPath)
+pq git scan --all                  # once: history before the install was never screened
+pq doctor                          # reports "git PHI screen installed" for this repo
+```
+
+What blocks: SSN, phone, email, MRN/CSN/account-number, credit card, IP and
+token shapes (the same regex floor as `pq scrub`), one line per finding as
+`path:LINE  KIND` with the value never echoed. `.docx/.xlsx/.pptx` are read
+with the stdlib, `.pdf` with the `[pdf]` extra; a file whose text cannot be
+extracted (legacy `.doc`, a PDF without `pypdf`, anything over 20 MB) blocks too
+(`git_unscannable_blocks: false` in config, or `--allow-unscannable`, to warn
+only). Possible names (spaCy PERSON) are advisory at push; `--strict` makes them
+block. The pre-commit hook runs `--no-ner` to stay fast.
+
+False positives are the human's call:
+
+- `phi-airgap: allow` anywhere on the line skips that line;
+  `phi-airgap: allow-file` in the first 20 lines skips the file.
+- `.phi-airgap-ignore` at the repo root holds path globs (`fixtures/*.csv`,
+  `*.min.js`), `#` comments allowed.
+
+The Claude Code hook denies the agent `--no-verify` / `-n` on commit and push,
+any `core.hooksPath` re-pointing, `pq git uninstall`, writes under `.git/hooks/`
+or to `.phi-airgap-ignore`, and any Write/Edit whose content carries an allow
+marker — so a finding is reported to you, not waved through. Review markers in
+PRs like you review policy changes.
+
+Using [pre-commit.com](https://pre-commit.com) instead of the raw hooks:
+
+```yaml
+repos:
+  - repo: https://github.com/midwest-data/phi-airgap
+    rev: v1.1.0
+    hooks:
+      - id: phi-airgap
+        # additional_dependencies: [pypdf]   # to read PDFs
+```
+
+Not included: a server-side GitHub Action (a fresh clone or a human with
+`--no-verify` bypasses local hooks; that is what an Action would close), OCR of
+scanned documents, and a baseline file for pre-existing findings.
+
+---
+
 ## The warehouse seam
 
 `config.adapter` selects a DBAPI adapter; `config.sql_dialect` sets the sqlglot
@@ -217,7 +270,7 @@ version:
 - **The k≥11 suppression plus identifier stripping only *approximates* Safe
   Harbor.** It is not an expert determination, and it is not a certification.
 - **Presidio is an alarm, not a save.** The NER pass has false negatives *by
-  construction* — in testing it scored `ssn 123-45-6789` at zero. A clean NER
+  construction* — in testing it scored `ssn 123-45-6789` at zero. A clean NER <!-- phi-airgap: allow -->
   pass is never proof that a result is PHI-free. When it *does* fire, that means
   the gate leaked and the policy needs fixing — treat it as a bug, not a catch.
 - **The gate is only as good as `policy.yml`.** An unclassified relation fails
