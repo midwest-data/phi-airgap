@@ -50,6 +50,11 @@ require_presidio: true
 # everything — `phi-airgap doctor` will tell you).
 hook_fail_open: false
 
+# `pq git scan` (the commit/push PHI screen): a file whose text cannot be
+# extracted — legacy .doc/.xls, a PDF without `pip install 'phi-airgap[pdf]'`,
+# anything over 20 MB — blocks the commit. Set false to warn only.
+git_unscannable_blocks: true
+
 # Row ceilings. Over the ceiling the result is REFUSED, not truncated —
 # truncating a 50,000-row name dump to 200 still emits 200 names.
 # The tight one applies whenever any RED or AMBER relation is read.

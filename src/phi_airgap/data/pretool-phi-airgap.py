@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hook-version: 1.2.0
+# hook-version: 1.3.0
 """
 PreToolUse:Bash|Read|Write|Edit|MultiEdit|Grep Hook: PHI Airgap enforcement (Claude Code).
 
@@ -34,11 +34,16 @@ Denied on Bash:
 - curl/wget/nc against the configured warehouse host
   (`pq` is the same CLI under its short alias and is judged identically)
 - phi-airgap run / uninstall / adopt, and `phi-airgap refresh` without --offline
+- `pq git uninstall` / `pq git install --force` (the commit/push PHI screen is
+  the human's to remove), `git commit/merge/rebase/am --no-verify` (`-n` on
+  commit), `git push --no-verify`, and any git invocation that re-points hooks
+  (core.hooksPath, hooks.*, GIT_DIR=)
 - reading a .env / .envrc / .env.<suffix> with a reader command, and redirecting
   into any of them (.env.example / .env.template / .env.sample stay readable)
 - writing to the control plane: the policy/config files, this hook, any
   .claude/settings*.json, the audit log (.phi-airgap/log.jsonl, ~/.phi-airgap/audit/),
-  the query history (.phi-airgap/out/history/) and ~/.phi-airgap/BYPASS
+  the query history (.phi-airgap/out/history/), ~/.phi-airgap/BYPASS, the
+  repo's .git/hooks/, .phi-airgap-ignore and .pre-commit-hooks.yaml
   (sed -i, tee, cp, mv, rm, >, >>, truncate, chmod, editors). The policy is the
   ACL; the human edits it.
 
@@ -47,6 +52,8 @@ Denied on Read / Grep (path):
 
 Denied on Write / Edit / MultiEdit (file_path):
 - everything in the Read list, plus the control-plane files above
+- any content carrying a `phi-airgap: allow` marker — the human waives a
+  PHI-screen finding, not the agent
 
 Allow-through:
 - everything else, including `phi-airgap schema`, `phi-airgap scrub`, `phi-airgap log`,
@@ -142,9 +149,11 @@ _PROTECTED_SUFFIXES = (
     "/.claude/hooks/pretool-phi-airgap.py",
     "/.claude/settings.json",
     "/.claude/settings.local.json",
+    "/.phi-airgap-ignore",
+    "/.pre-commit-hooks.yaml",
 )
 # Directories whose every file is protected.
-_PROTECTED_DIRS = ("/.phi-airgap/audit/", "/.phi-airgap/out/history/")
+_PROTECTED_DIRS = ("/.phi-airgap/audit/", "/.phi-airgap/out/history/", "/.git/hooks/")
 # Any settings file of the harness: settings.json, settings.local.json, settings.<x>.json.
 _SETTINGS_FILE = re.compile(r"/\.claude/settings[^/]*\.json$")
 
@@ -239,7 +248,8 @@ _PY_FORBIDDEN = re.compile(
     r"|urllib|requests|http\.client|httpx|aiohttp|socket\b"
     r"|\bfetch\s*\(|\bnet\.connect|Net::HTTP|net/https?\b|LWP::|curl_init"
     # The control plane by path: an interpreter can write what the shell writers cannot.
-    r"|\.phi-airgap/|\.claude/|pretool-phi-airgap|settings\.local|\bBYPASS\b",
+    r"|\.phi-airgap/|\.claude/|pretool-phi-airgap|settings\.local|\bBYPASS\b"
+    r"|\.git/hooks|phi-airgap-ignore",
     re.IGNORECASE,
 )
 
@@ -251,6 +261,16 @@ _DBT_BLOCKED = {"show", "run-operation"}
 # hits information_schema by default, but `--offline` reads only a local dbt
 # manifest and writes column names, which are not PHI.
 _PQ_BLOCKED = {"run", "uninstall", "adopt"}
+
+# The git PHI screen (`pq git install` writes pre-commit/pre-push hooks). The
+# agent may run and install it, never remove it or skip it.
+_GIT_SKIP_REASON = (
+    "`--no-verify` skips the PHI screen on this commit/push. Commit without it; if the "
+    "screen flagged a false positive, ask the user to mark it (`phi-airgap: allow`). "
+)
+_GIT_HOOKS_REPOINT = re.compile(r"core\.hooksPath|\bhooks\.\w+", re.IGNORECASE)
+_GIT_NO_VERIFY_SUBS = {"commit", "merge", "rebase", "am", "push"}
+_ALLOW_MARKER = "phi-airgap: allow"
 
 # Commands that would read a credential file out to stdout or into the env.
 _READERS = {
@@ -516,6 +536,18 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
         if exe == "dbt" and sub in _DBT_BLOCKED:
             return f"`dbt {sub}` prints result rows and is blocked. " + _PROTOCOL
 
+        if exe == "git":
+            if _GIT_HOOKS_REPOINT.search(seg) or any(t.startswith("GIT_DIR=") for t in tokens):
+                return (
+                    "Re-pointing git hooks (core.hooksPath, hooks.*, GIT_DIR) disables the PHI "
+                    "screen on commits and pushes. " + _PROTOCOL
+                )
+            if sub in _GIT_NO_VERIFY_SUBS and "--no-verify" in words:
+                return _GIT_SKIP_REASON + _PROTOCOL
+            # `-n` is --no-verify on commit only (dry-run on push, --no-stat on merge).
+            if sub == "commit" and any(re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", w) for w in words[1:]):
+                return _GIT_SKIP_REASON + _PROTOCOL
+
         if exe in ("phi-airgap", "pq"):  # `pq` is the packaged short alias
             if sub in _PQ_BLOCKED:
                 return (
@@ -530,6 +562,13 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
             # `phi-airgap dbt show` — the blocked subcommand sits one level in.
             if sub == "dbt" and _subcommand(words[words.index("dbt") :]) in _DBT_BLOCKED:
                 return "`dbt show`/`run-operation` print result rows. " + _PROTOCOL
+            if sub == "git":
+                gsub = _subcommand(words[words.index("git") :])
+                if gsub == "uninstall" or (gsub == "install" and "--force" in words):
+                    return (
+                        "The git PHI screen (pre-commit/pre-push hooks) is the human's to remove "
+                        "or replace. `pq git scan` and `pq git install` are yours. " + _PROTOCOL
+                    )
             continue  # every other phi-airgap subcommand is on the allowlist
 
         # Credential files: only when something would actually read or write one.
@@ -581,9 +620,18 @@ def _check_read(path: str) -> str | None:
     return None
 
 
-def _check_write(path: str) -> str | None:
+def _check_write(path: str, tool_input: dict) -> str | None:
     if _is_protected(path):
         return f"{_PROTECTED_REASON} {_PROTOCOL}"
+    # Write.content, Edit.new_string, MultiEdit.edits[].new_string.
+    texts = [tool_input.get("content", ""), tool_input.get("new_string", "")]
+    texts += [e.get("new_string", "") for e in tool_input.get("edits", []) or []
+              if isinstance(e, dict)]
+    if any(_ALLOW_MARKER in str(t) for t in texts):
+        return (
+            f"`{_ALLOW_MARKER}` waives a PHI-screen finding; the human adds that marker after "
+            "reviewing the line, not the agent. Report the finding and ask. " + _PROTOCOL
+        )
     return _check_read(path)
 
 
@@ -632,7 +680,7 @@ def main() -> None:
     if tool in ("Read", "Grep"):
         reason = _check_read(str(tool_input.get("file_path") or tool_input.get("path") or ""))
     elif tool in ("Write", "Edit", "MultiEdit"):
-        reason = _check_write(str(tool_input.get("file_path", "")))
+        reason = _check_write(str(tool_input.get("file_path", "")), tool_input)
     else:
         command = tool_input.get("command", "")
         reason = _check_bash(command) if command else None

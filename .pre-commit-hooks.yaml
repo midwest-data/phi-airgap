@@ -1,0 +1,14 @@
+# pre-commit.com entry. Consumers:
+#   repos:
+#     - repo: https://github.com/midwest-data/phi-airgap
+#       rev: v1.1.0
+#       hooks: [{id: phi-airgap}]
+# `pre-commit install --hook-type pre-commit --hook-type pre-push` then screens
+# every staged file; add `additional_dependencies: [pypdf]` to read PDFs.
+- id: phi-airgap
+  name: phi-airgap PHI screen
+  description: block files carrying SSN/MRN/phone/email/token shapes (regex floor; names advisory)
+  entry: pq git scan --no-ner --
+  language: python
+  pass_filenames: true
+  stages: [pre-commit, pre-push]

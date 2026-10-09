@@ -45,7 +45,7 @@ _NUMERIC = re.compile(r"^-?[\d,]+(\.\d+)?$")
 # ── Deterministic layer ──────────────────────────────────────────────────────
 # Regex, not NER. These shapes never legitimately appear in an aggregate
 # result, and unlike the model they cannot miss. Measured: Presidio scored
-# `ssn 123-45-6789` at zero — the SSN recognizer needs surrounding context it
+# `ssn 123-45-6789` at zero (phi-airgap: allow) — the SSN recognizer needs context it
 # will not always get. Deterministic patterns are the floor that the
 # statistical layer sits on top of, never the reverse.
 #

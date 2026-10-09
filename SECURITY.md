@@ -58,7 +58,7 @@ queries, read credentials, or read raw extracts. A human runs `phi-airgap run`.
 - **The scrubber** has a deterministic floor (regex for SSN/phone/email/MRN/
   tokens) that cannot miss the shapes it knows, and a statistical ceiling
   (Presidio NER) that **has false negatives by construction**. Presidio scored
-  `ssn 123-45-6789` at zero in testing. A clean NER pass is not proof of
+  `ssn 123-45-6789` at zero in testing. A clean NER pass is not proof of <!-- phi-airgap: allow -->
   anything. When NER *fires*, the gate already leaked — fix the policy.
 - **The hook** enforces the human-runs-the-query rule at the harness level. It
   **fails closed**: malformed input or a crash exits 2 and the harness blocks
@@ -156,6 +156,14 @@ we intend to fix by adding a rule:
   leave raw extracts in the workspace.
 - **Interpreter writes to the control plane** — see above; the policy-hash
   banner is the detection, not a prevention.
+- **The git PHI screen is local.** `pq git install` hooks stop a commit or push
+  from this clone; a fresh clone without the hooks, or a human typing
+  `--no-verify`, is not stopped (the agent is — the harness hook denies it).
+  A server-side check would close that; it is not shipped. Image-only PDFs and
+  scanned documents are not OCR'd; legacy `.doc`/`.xls` block rather than scan;
+  names are advisory (spaCy misses and over-fires); and an allow marker is a
+  trust decision — review `phi-airgap: allow` lines and `.phi-airgap-ignore`
+  globs in PRs as you would a policy change.
 
 **Out of scope:** phi-airgap does not defend against a malicious operator, a
 compromised warehouse, side channels in aggregate statistics beyond the k-anon

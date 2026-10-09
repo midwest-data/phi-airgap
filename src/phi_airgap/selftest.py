@@ -1,6 +1,7 @@
 """Red-team the gate, the scrubber and the harness hook.
 
 Run:  phi-airgap selftest     (or: pytest tests/)
+The fixtures below hold fake identifiers on purpose — phi-airgap: allow-file.
 Needs sqlglot + PyYAML; no network, no token. The Presidio cases are exercised
 by the scrubber's own tests; the deterministic layer here needs no NER.
 
@@ -545,6 +546,134 @@ def _ner_smoke() -> list[str]:
     return fails
 
 
+def _git_hooks() -> list[str]:
+    """`pq git`: staged/range/pre-push scans block on identifiers, honour the allow
+    marker and the ignore file, read .docx, block unscannable files, and the
+    installed hooks refuse a real commit. The report never echoes a value."""
+    import contextlib
+    import io
+    import zipfile
+
+    from . import cli, gitscan
+
+    fails = []
+
+    def pq(*argv: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                rc = cli.main(["git", *argv])
+            except SystemExit as e:
+                rc = int(e.code or 0)
+        return rc, err.getvalue()
+
+    def git(*argv: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *argv], capture_output=True, text=True, env=env)
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d).resolve()
+        old = (os.getcwd(), os.environ.get("PHI_AIRGAP_ROOT"), util.HOME_DIR)
+        os.chdir(d)
+        os.environ["PHI_AIRGAP_ROOT"] = str(d)
+        util.HOME_DIR = d / "home"
+        try:
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "t@example.com")
+            git("config", "user.name", "t")
+            git("config", "commit.gpgsign", "false")
+
+            (d / "notes.txt").write_text("ssn 123-45-6789\n")  # phi-airgap: allow
+            git("add", "notes.txt")
+            rc, out = pq("scan", "--staged", "--no-ner")
+            if rc != 1 or "notes.txt:1" not in out or "US_SSN" not in out:
+                fails.append(f"GIT scan should block a staged SSN with path:line, got {rc} {out!r}")
+            if "123-45" in out:
+                fails.append("GIT scan report must not echo the matched value")
+            (d / "notes.txt").write_text("ssn 123-45-6789  # phi-airgap: allow\n")
+            git("add", "notes.txt")
+            if pq("scan", "--staged", "--no-ner")[0] != 0:
+                fails.append("GIT scan should honour the line allow marker")
+            (d / "notes.txt").write_text("ssn 123-45-6789\n")  # phi-airgap: allow
+            (d / gitscan.IGNORE_FILE).write_text("# fixtures\nnotes.*\n")
+            git("add", "notes.txt")
+            if pq("scan", "--staged", "--no-ner")[0] != 0:
+                fails.append(f"GIT scan should honour {gitscan.IGNORE_FILE} globs")
+            (d / gitscan.IGNORE_FILE).unlink()
+            git("rm", "-q", "--cached", "notes.txt")
+            (d / "notes.txt").unlink()
+
+            with zipfile.ZipFile(d / "x.docx", "w") as z:
+                z.writestr("word/document.xml", "<w:p><w:t>call 555-867-5309</w:t></w:p>")
+            git("add", "x.docx")
+            rc, out = pq("scan", "--staged", "--no-ner")
+            if rc != 1 or "PHONE_NUMBER" not in out:
+                fails.append(f"GIT scan should read .docx text, got {rc} {out!r}")
+            git("rm", "-q", "--cached", "x.docx")
+            (d / "x.pdf").write_bytes(b"%PDF-1.4 not really")
+            git("add", "x.pdf")
+            rc, out = pq("scan", "--staged", "--no-ner")
+            if rc != 1 or "unscannable: x.pdf" not in out:
+                fails.append(f"GIT scan should block an unreadable pdf, got {rc} {out!r}")
+            if pq("scan", "--staged", "--no-ner", "--allow-unscannable")[0] != 0:
+                fails.append("GIT scan --allow-unscannable should pass an unreadable pdf")
+            git("rm", "-q", "--cached", "x.pdf")
+
+            (d / "clean.txt").write_text("nothing here\n")
+            git("add", "clean.txt")
+            git("commit", "-qm", "clean")
+            git("checkout", "-qb", "feature")
+            (d / "more.txt").write_text("mrn 1234567\n")  # phi-airgap: allow
+            git("add", "more.txt")
+            git("commit", "-qm", "dirty")
+            rc, out = pq("scan", "--range", "main..feature", "--no-ner")
+            if rc != 1 or "more.txt:1" not in out or "RECORD_NUMBER" not in out:
+                fails.append(f"GIT scan --range should block a committed MRN, got {rc} {out!r}")
+            (d / "more.txt").write_text("fixed\n")
+            git("commit", "-qam", "contact m.gonzalez@example.com")  # phi-airgap: allow
+            rc, out = pq("scan", "--range", "main..feature", "--no-ner")
+            if rc != 1 or "EMAIL_ADDRESS" not in out or "commit messages" not in out:
+                fails.append(f"GIT scan --range should screen commit messages, got {rc} {out!r}")
+            tip = git("rev-parse", "feature").stdout.strip()
+            stdin, sys.stdin = sys.stdin, io.StringIO(
+                f"refs/heads/feature {tip} refs/heads/feature {'0' * 40}\n"
+            )
+            try:
+                rc, out = pq("scan", "--pre-push", "--no-ner")
+            finally:
+                sys.stdin = stdin
+            if rc != 1 or "EMAIL_ADDRESS" not in out:
+                fails.append(f"GIT scan --pre-push should screen a new branch, got {rc} {out!r}")
+
+            hooks = d / ".git" / "hooks"
+            (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n")  # a foreign hook
+            if pq("install")[0] == 0:
+                fails.append("GIT install should refuse to overwrite a foreign hook")
+            if pq("install", "--force")[0] != 0 or not (hooks / "pre-push.bak").exists():
+                fails.append("GIT install --force should back up the foreign hook")
+            # The installed hook must stop a real commit when `pq` resolves on PATH.
+            env = {**os.environ, "PATH": f"{Path(sys.executable).parent}{os.pathsep}"
+                   + os.environ.get("PATH", "")}
+            if shutil.which("pq", path=env["PATH"]):
+                (d / "leak.txt").write_text("ssn 123-45-6789\n")  # phi-airgap: allow
+                git("add", "leak.txt")
+                r = git("commit", "-qm", "leak", env=env)
+                if r.returncode == 0 or "US_SSN" not in r.stderr:
+                    fails.append(f"GIT pre-commit hook should stop the commit: {r.stderr!r}")
+                git("rm", "-q", "--cached", "leak.txt")
+            if pq("uninstall")[0] != 0 or (hooks / "pre-commit").exists():
+                fails.append("GIT uninstall should remove our hooks")
+            if not (hooks / "pre-push.bak").exists():
+                fails.append("GIT uninstall must leave foreign files alone")
+        finally:
+            os.chdir(old[0])
+            util.HOME_DIR = old[2]
+            if old[1] is None:
+                os.environ.pop("PHI_AIRGAP_ROOT", None)
+            else:
+                os.environ["PHI_AIRGAP_ROOT"] = old[1]
+    return fails
+
+
 HOOK_DENY = [
     'python3 -c "from databricks import sql"',
     "cat .envrc",
@@ -664,6 +793,19 @@ HOOK_DENY = [
     # A newline separates commands; the lexer must not swallow it as whitespace.
     "git status\nphi-airgap run q.sql",
     "echo hi\n\nsecurity find-generic-password -s phi-airgap-databricks-pat -w",
+    # The git PHI screen: no skipping it, no re-pointing it, no removing it.
+    "git commit --no-verify -m x",
+    "git commit -n -m x",
+    "git commit -anm x",
+    "git push --no-verify origin main",
+    "git -c core.hooksPath=/tmp/h push",
+    "git config core.hooksPath /tmp/h",
+    "GIT_DIR=/tmp/x git commit -m x",
+    "pq git uninstall",
+    "pq git install --force",
+    "echo x > .git/hooks/pre-push",
+    "rm .git/hooks/pre-commit",
+    "python3 -c \"open('.git/hooks/pre-push', 'w')\"",
 ]
 
 HOOK_ALLOW = [
@@ -720,6 +862,13 @@ HOOK_ALLOW = [
     "echo x > .claude/notes.json",
     "git add -A\ngit commit -m 'multi-line is fine'",
     "python3 -c 'print(\"a\\nb\")'",
+    # The git PHI screen: running and installing it is the agent's.
+    "pq git scan --staged",
+    "pq git scan --all",
+    "pq git install",
+    "git push -n origin main",  # -n is dry-run on push
+    "git merge -n feature",  # -n is --no-stat on merge
+    'git commit -am "no-verify is bad"',
 ]
 
 HOOK_READ_DENY = [
@@ -759,6 +908,9 @@ HOOK_WRITE_DENY = [
     "/Users/x/.phi-airgap/BYPASS",
     "/Users/x/.phi-airgap/audit/abc123.jsonl",
     "/Users/x/project/.phi-airgap/out/history/20250101T000000-abcd1234.sql",
+    "/Users/x/project/.git/hooks/pre-push",
+    "/Users/x/project/.phi-airgap-ignore",
+    "/Users/x/project/.pre-commit-hooks.yaml",
 ]
 
 HOOK_WRITE_ALLOW = [
@@ -975,6 +1127,7 @@ def main() -> int:
     fails += _ner_smoke()
     fails += _run_end_to_end()
     fails += _stats()
+    fails += _git_hooks()
 
     if HOOK.exists():
         # A scratch HOME: the hook reads ~/.phi-airgap/config.yml (a concrete host
@@ -1039,6 +1192,20 @@ def main() -> int:
             grep = {"tool_name": "Grep", "tool_input": {"pattern": "T", "path": "/x/.env"}}
             if not _hook(grep, env):
                 fails.append("HOOK should DENY Grep on .env")
+            # Allow markers are the human's: any write payload carrying one is denied.
+            for payload in (
+                {"tool_name": "Write",
+                 "tool_input": {"file_path": "/x/notes.txt", "content": "# phi-airgap: allow"}},
+                {"tool_name": "Edit", "tool_input": {
+                    "file_path": "/x/n.py", "old_string": "a",
+                    "new_string": "b  # phi-airgap: allow"}},
+                {"tool_name": "MultiEdit", "tool_input": {"file_path": "/x/n.py", "edits": [
+                    {"old_string": "a", "new_string": "# phi-airgap: allow-file"}]}},
+            ):
+                if not _hook(payload, env):
+                    fails.append(
+                        f"HOOK should DENY writing an allow marker via {payload['tool_name']}"
+                    )
             for tool in ("Write", "Edit", "MultiEdit"):
                 for p in HOOK_WRITE_DENY:
                     if not _hook({"tool_name": tool, "tool_input": {"file_path": p}}, env):
@@ -1051,7 +1218,7 @@ def main() -> int:
 
     total = sum(
         map(len, (DENY, ALLOW, HOOK_DENY, HOOK_ALLOW, HOOK_READ_DENY, HOOK_READ_ALLOW))
-    ) + 3 * (len(HOOK_WRITE_DENY) + len(HOOK_WRITE_ALLOW)) + 7
+    ) + 3 * (len(HOOK_WRITE_DENY) + len(HOOK_WRITE_ALLOW)) + 7 + 3 + 1  # marker writes, _git_hooks
     for f in fails:
         print(f"FAIL  {f}")
     print(f"\n{total - len(fails)}/{total} cases pass" + (" — PHI-AIRGAP OK" if not fails else ""))
