@@ -60,3 +60,16 @@ git_unscannable_blocks: true
 # The tight one applies whenever any RED or AMBER relation is read.
 max_rows_sensitive: 200
 max_rows: 5000
+
+# --- Site options (all off by default; the hook reads these too) -------------
+# Per-workspace directory name (q.sql, out/, meta/, log.jsonl). Its raw outputs,
+# log and query history get the same protection as the default name.
+workspace_dir: .phi-airgap
+# `deny` (default): only the human runs `phi-airgap run`. `ask`: the agent may run
+# it, and the hook shows the user the full SQL for approval — only in permission
+# modes that show a prompt (default/acceptEdits/plan); every other mode denies.
+run_approval: deny
+# true: exactly `<default_root>/.env` is readable, for a workspace whose root
+# .env holds only a credential that reaches no sensitive data (e.g. an issue
+# tracker key). Nested .env files, .envrc and .env.<suffix> stay denied.
+readable_root_env: false

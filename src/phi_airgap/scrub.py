@@ -73,6 +73,8 @@ _DETERMINISTIC: list[tuple[str, re.Pattern]] = [
     # plus any secret introduced by a labelling keyword (catches warehouse PATs,
     # bearer tokens, api keys) without hard-coding one vendor's token shape.
     ("TOKEN", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    # Bare (unlabelled) Databricks PATs and Linear API keys: distinctive prefixes.
+    ("TOKEN", re.compile(r"\b(?:dapi[0-9a-f]{24,}|lin_api_[A-Za-z0-9]{20,})\b")),
     (
         "TOKEN",
         re.compile(

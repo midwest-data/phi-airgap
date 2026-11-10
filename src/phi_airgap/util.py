@@ -6,6 +6,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,6 +51,8 @@ POLICY_FILE = _pick("PHI_AIRGAP_POLICY", "policy.yml")
 
 DEFAULT_CONFIG = {
     "default_root": ".",
+    # Per-workspace directory name (q.sql, out/, meta/, log.jsonl). The hook reads it too.
+    "workspace_dir": ".phi-airgap",
     "adapter": "databricks",
     "sql_dialect": "databricks",
     "keychain_service": "phi-airgap-databricks-pat",
@@ -87,24 +90,38 @@ def config() -> dict:
     return cfg
 
 
-def root() -> Path:
-    """Workspace root that owns the .phi-airgap directory.
+_WORKSPACE_DIR_OK = re.compile(r"^\.[\w.-]+$")
 
-    PHI_AIRGAP_ROOT wins, then the nearest ancestor already holding a .phi-airgap dir (so
+
+def workspace_dir_name() -> str:
+    """The per-workspace directory name (config `workspace_dir`, default .phi-airgap).
+
+    Must be a single dot-directory name; anything else falls back to the default,
+    because the hook builds deny patterns from the same value.
+    """
+    name = str(config().get("workspace_dir") or ".phi-airgap")
+    return name if _WORKSPACE_DIR_OK.match(name) else ".phi-airgap"
+
+
+def root() -> Path:
+    """Workspace root that owns the workspace directory (.phi-airgap by default).
+
+    PHI_AIRGAP_ROOT wins, then the nearest ancestor already holding that dir (so
     git worktrees get their own), then the configured default, then cwd.
     """
     if env := os.environ.get("PHI_AIRGAP_ROOT"):
         return Path(env).expanduser().resolve()
+    name = workspace_dir_name()
     cwd = Path.cwd().resolve()
     for parent in (cwd, *cwd.parents):
-        if (parent / ".phi-airgap").is_dir():
+        if (parent / name).is_dir():
             return parent
     default = Path(config()["default_root"]).expanduser()
     return default.resolve() if default.is_dir() else cwd
 
 
 def phi_airgap_dir() -> Path:
-    d = root() / ".phi-airgap"
+    d = root() / workspace_dir_name()
     (d / "out").mkdir(parents=True, exist_ok=True)
     (d / "meta").mkdir(parents=True, exist_ok=True)
     return d
