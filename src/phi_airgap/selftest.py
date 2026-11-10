@@ -423,6 +423,8 @@ def _deterministic_redaction() -> list[str]:
         ("CSN: 987654321", "RECORD_NUMBER"),
         ("token ghp_3m2irMIabcdefghijklmnopqrstuvwxyz12", "TOKEN"),
         ("host 10.4.22.19", "IP_ADDRESS"),
+        ("see dapi" + "0a" * 16, "TOKEN"),  # bare Databricks PAT shape
+        ("see lin_api_" + "Ab3" * 10, "TOKEN"),  # bare Linear key shape
     ]
     for text, expected in cases:
         cleaned, kinds = scrub.deterministic(text)
@@ -774,6 +776,8 @@ HOOK_DENY = [
     'security find-generic-password -a "$USER" -s phi-airgap-databricks-pat -w',
     'security find-generic-password -a "$USER" -s phi-airgap-github-pat -w',
     f"curl -H 'Authorization: Bearer x' https://{HOST}/api/2.0/sql",
+    "curl -s https://adb-999.9.azuredatabricks.net/api/2.0/sql/statements",  # any workspace
+    "wget https://acct.snowflakecomputing.com/api",
     "phi-airgap run .phi-airgap/q.sql",
     # `pq` is the same CLI under its short alias.
     "pq run .phi-airgap/q.sql",
@@ -1194,6 +1198,68 @@ def _bash(cmd: str) -> dict:
     return {"tool_name": "Bash", "tool_input": {"command": cmd}}
 
 
+def _site_options() -> list[str]:
+    """workspace_dir / run_approval: ask / readable_root_env, in a scratch HOME."""
+    fails = []
+    with tempfile.TemporaryDirectory() as d:
+        home, ws = Path(d) / "home", Path(d) / "ws"
+        (home / ".phi-airgap").mkdir(parents=True)
+        (ws / ".pq" / "out").mkdir(parents=True)
+        (ws / "sub").mkdir()
+        (ws / ".pq" / "q.sql").write_text("select dept, count(*) as n from t group by 1\n")
+        (home / ".phi-airgap" / "config.yml").write_text(
+            f"host: {HOST}\nworkspace_dir: .pq\nrun_approval: ask\n"
+            f"readable_root_env: true\ndefault_root: {ws}\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PHI_AIRGAP_")}
+        env["HOME"] = str(home)
+
+        def verdict(payload: dict, mode: str = "default") -> str:
+            out = _hook_raw(json.dumps({**payload, "cwd": str(ws), "permission_mode": mode}),
+                            env, str(ws)).stdout
+            return "deny" if '"deny"' in out else "ask" if '"ask"' in out else "allow"
+
+        def read(p: str) -> dict:
+            return {"tool_name": "Read", "tool_input": {"file_path": p}}
+
+        def write(p: str) -> dict:
+            return {"tool_name": "Write", "tool_input": {"file_path": p, "content": "x"}}
+
+        cases = [
+            (_bash("pq run .pq/q.sql"), "default", "ask"),
+            (_bash("pq run .pq/q.sql"), "bypassPermissions", "deny"),
+            (_bash("pq run .pq/missing.sql"), "default", "deny"),
+            (_bash("pq run"), "default", "deny"),
+            (_bash("pq run .pq/q.sql && cat sub/.env"), "default", "deny"),  # deny wins
+            (_bash("cat .env"), "default", "allow"),
+            (_bash("cat sub/.env"), "default", "deny"),
+            (_bash("cat .envrc"), "default", "deny"),
+            (_bash("python3 -c \"open('.pq/out/q.csv')\""), "default", "allow"),
+            (_bash("python3 -c \"open('.pq/log.jsonl', 'w')\""), "default", "deny"),
+            (read(f"{ws}/.env"), "default", "allow"),
+            (read(f"{ws}/sub/.env"), "default", "deny"),
+            (read(f"{ws}/.pq/out/q.raw.csv"), "default", "deny"),
+            (read(f"{ws}/.phi-airgap/out/q.raw.csv"), "default", "deny"),  # default stays
+            (read(f"{ws}/.pq/out/q.csv"), "default", "allow"),
+            (write(f"{ws}/.pq/log.jsonl"), "default", "deny"),
+            (write(f"{ws}/.pq/out/history/1.sql"), "default", "deny"),
+        ]
+        for payload, mode, want in cases:
+            if (got := verdict(payload, mode)) != want:
+                fails.append(
+                    f"SITE OPTIONS: {payload['tool_input']} [{mode}] -> {got}, want {want}"
+                )
+        # The ask must carry the SQL so the user reviews what actually runs.
+        out = _hook_raw(json.dumps({**_bash("pq run .pq/q.sql"), "cwd": str(ws),
+                                    "permission_mode": "default"}), env, str(ws)).stdout
+        if "count(*) as n" not in out:
+            fails.append("SITE OPTIONS: the run ASK should show the SQL")
+    return fails
+
+
+_SITE_OPTION_CASES = 18
+
+
 def main() -> int:
     fails = []
 
@@ -1214,6 +1280,7 @@ def main() -> int:
     fails += _adopt_roundtrip()
     fails += _ner_smoke()
     fails += _eml_redaction()
+    fails += _site_options()
     fails += _run_end_to_end()
     fails += _stats()
     fails += _git_hooks()
@@ -1308,7 +1375,8 @@ def main() -> int:
     total = sum(
         map(len, (DENY, ALLOW, HOOK_DENY, HOOK_ALLOW, HOOK_READ_DENY, HOOK_READ_ALLOW))
     ) + 3 * (len(HOOK_WRITE_DENY) + len(HOOK_WRITE_ALLOW)) + 7 + 3 + 1 + 1
-    # ^ marker writes, _git_hooks, _eml_redaction
+    total += _SITE_OPTION_CASES
+    # ^ marker writes, _git_hooks, _eml_redaction; then the site options
     for f in fails:
         print(f"FAIL  {f}")
     print(f"\n{total - len(fails)}/{total} cases pass" + (" — PHI-AIRGAP OK" if not fails else ""))

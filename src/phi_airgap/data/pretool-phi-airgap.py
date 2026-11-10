@@ -71,6 +71,17 @@ it). Only flat scalars are read (no yaml dependency — the hook runs on the
 system python). Missing config falls back to safe defaults: no readable
 Keychain service, host unset, fail closed.
 
+Site options (all off by default):
+- workspace_dir: <.name>   the per-workspace directory (default .phi-airgap). Its
+  out/*.raw.*, log.jsonl and out/history/ get the same protection.
+- run_approval: ask        `phi-airgap run <f.sql>` becomes an ASK that shows the
+  user the full SQL, instead of a deny. Only in permission modes that show a
+  prompt (default/acceptEdits/plan); every other mode still denies, because an
+  "ask" nobody sees is an allow. No readable .sql file named -> deny.
+- readable_root_env: true  `<default_root>/.env` (exactly that file) is readable,
+  for a workspace whose root .env holds only a credential that reaches no
+  sensitive data. Every nested .env, .envrc and .env.<suffix> stays denied.
+
 Verified by tests/test_airgap.py (`phi-airgap selftest`).
 """
 
@@ -84,14 +95,6 @@ from pathlib import Path
 
 _HOME_DIR = Path.home() / ".phi-airgap"
 _BYPASS_FILE = _HOME_DIR / "BYPASS"
-
-_PROTOCOL = (
-    "PHI AIRGAP: live row-grain data must not reach your context. Do not execute "
-    "queries. Instead: write the SQL to .phi-airgap/q.sql and ask the user to run "
-    "`! phi-airgap run .phi-airgap/q.sql`. Read the scrubbed result at .phi-airgap/out/q.csv "
-    "and the ALLOW/DENY verdict at .phi-airgap/out/q.json. For column names use "
-    "`phi-airgap schema <pattern>` (local cache, no network)."
-)
 
 # --- config (dependency-free flat-scalar reader) -----------------------------
 
@@ -139,6 +142,40 @@ def _warehouse_host() -> str:
     return _config_value("host", "")
 
 
+def _workspace_dir() -> str:
+    v = _config_value("workspace_dir", ".phi-airgap")
+    return v if re.match(r"^\.[\w.-]+$", v) else ".phi-airgap"
+
+
+_WS = _workspace_dir()
+# Both names stay protected, so switching workspace_dir never unprotects the default.
+_WS_DIRS = tuple(sorted({".phi-airgap", _WS}))
+_RUN_ASK = _config_value("run_approval", "deny").lower() == "ask"
+_ROOT_ENV_READABLE = _config_value("readable_root_env", "false").lower() == "true"
+_ASK_SQL_CHARS = 6000
+# Modes known to show a permission prompt for a hook "ask".
+_PROMPTING_MODES = {"default", "acceptEdits", "plan"}
+
+
+def _workspace_root() -> str:
+    return os.path.realpath(os.path.expanduser(_config_value("default_root", ".")))
+
+
+_PROTOCOL = (
+    "PHI AIRGAP: live row-grain data must not reach your context. Do not execute "
+    f"queries. Instead: write the SQL to {_WS}/q.sql and ask the user to run "
+    f"`! phi-airgap run {_WS}/q.sql`"
+    + (
+        " (or, in default/acceptEdits/plan mode, run `pq run` yourself: the user approves "
+        "the SQL in a prompt)"
+        if _RUN_ASK else ""
+    )
+    + f". Read the scrubbed result at {_WS}/out/q.csv and the ALLOW/DENY verdict at "
+    f"{_WS}/out/q.json. For column names use `phi-airgap schema <pattern>` (local cache, "
+    "no network)."
+)
+
+
 # --- the control plane --------------------------------------------------------
 # The policy is the ACL the gate enforces; the hook and settings.json are what
 # make it bite. The agent may read them, never rewrite them. The audit log and
@@ -154,9 +191,11 @@ _PROTECTED_SUFFIXES = (
     "/.claude/settings.local.json",
     "/.phi-airgap-ignore",
     "/.pre-commit-hooks.yaml",
-)
+) + tuple(f"/{d}/log.jsonl" for d in _WS_DIRS)
 # Directories whose every file is protected.
-_PROTECTED_DIRS = ("/.phi-airgap/audit/", "/.phi-airgap/out/history/", "/.git/hooks/")
+_PROTECTED_DIRS = ("/.phi-airgap/audit/", "/.git/hooks/") + tuple(
+    f"/{d}/out/history/" for d in _WS_DIRS
+)
 # Any settings file of the harness: settings.json, settings.local.json, settings.<x>.json.
 _SETTINGS_FILE = re.compile(r"/\.claude/settings[^/]*\.json$")
 
@@ -252,7 +291,10 @@ _PY_FORBIDDEN = re.compile(
     r"|\bfetch\s*\(|\bnet\.connect|Net::HTTP|net/https?\b|LWP::|curl_init"
     # The control plane by path: an interpreter can write what the shell writers cannot.
     r"|\.phi-airgap/|\.claude/|pretool-phi-airgap|settings\.local|\bBYPASS\b"
-    r"|\.git/hooks|phi-airgap-ignore",
+    r"|\.git/hooks|phi-airgap-ignore"
+    # A custom workspace_dir: only its record (log, query history), not its
+    # scrubbed outputs, which scripts may legitimately read.
+    + "|" + re.escape(_WS) + r"/(?:log\.jsonl|out/history)",
     re.IGNORECASE,
 )
 
@@ -306,10 +348,17 @@ def _denied_envfile(seg: str) -> bool:
       .env, dir/.env, a/b/.env         -> denied
       .env.local, .env.pre-airgap      -> denied
       .env.example/.template/.sample   -> allowed, they are documentation
+      .env, ./.env                     -> allowed ONLY with readable_root_env
+
+    readable_root_env caveat: the shell check is textual, so a bare `.env` typed
+    from another cwd is allowed too. Every other env file is reachable only
+    through a directory component, so those stay denied. The Read path is exact.
     """
     for m in _ENVFILE_TOKEN.finditer(seg):
         base = m.group(0)[m.end(1) - m.start(0) :]
         if base in _DOC_SUFFIXES:
+            continue
+        if _ROOT_ENV_READABLE and base == ".env" and m.group(1) in ("", "./"):
             continue
         return True
     return False
@@ -464,15 +513,56 @@ def _script_payload(words: list[str]) -> str:
 
 
 def _warehouse_http(code: str) -> bool:
-    """True if a curl/wget/nc/http segment targets the configured warehouse host."""
-    host = _warehouse_host()
-    if not host:
-        return False
+    """True if a curl/wget/nc/http segment targets the configured warehouse host,
+    or any hosted-warehouse API domain (another workspace can hold PHI too)."""
+    targets = [re.escape(h) for h in [_warehouse_host()] if h] + [
+        r"[\w.-]+\.azuredatabricks\.net",
+        r"[\w.-]+\.cloud\.databricks\.com",
+        r"[\w.-]+\.gcp\.databricks\.com",
+        r"[\w.-]+\.snowflakecomputing\.com",
+    ]
     return bool(
         re.search(
-            rf"\b(?:curl|wget|http|httpie|nc)\b[^;&|]*{re.escape(host)}", code, re.IGNORECASE
+            rf"\b(?:curl|wget|http|httpie|nc)\b[^;&|]*(?:{'|'.join(targets)})", code,
+            re.IGNORECASE,
         )
     )
+
+
+# run_approval: ask. _check_bash returns deny reasons; asks are collected here
+# and only win when no segment denies. The event's cwd resolves relative paths.
+# ponytail: module state is fine for a one-shot process.
+_ASKS: list[str] = []
+_CWD = "."
+
+
+def _run_prompt(words: list[str]) -> tuple[str, str]:
+    """('ask', the SQL to show the user) or ('deny', why) for one `run` segment.
+
+    ponytail: files are read at prompt time; an edit between approve and run
+    (another session) is not caught. Hash-pin in `run` itself if that matters.
+    """
+    files = [w for w in words[2:] if w.endswith(".sql")]
+    if not files:
+        return "deny", "`run` with no .sql file has no query to show for approval. " + _PROTOCOL
+    parts = []
+    for f in files:
+        text = None
+        for base in (_CWD, _workspace_root()):
+            p = Path(base, os.path.expanduser(f))
+            try:
+                if p.is_file():
+                    text = p.read_text(errors="replace")
+                    break
+            except OSError:
+                pass
+        if text is None:
+            return "deny", f"`run`: could not read {f} to show the query for approval. " + _PROTOCOL
+        if len(text) > _ASK_SQL_CHARS:
+            text = text[:_ASK_SQL_CHARS] + f"\n... [truncated, {len(text)} chars total]"
+        parts.append(f"--- {f} ---\n{text.strip()}")
+    head = "PHI airgap: approve this warehouse query? Read it first.\n\n"
+    return "ask", head + "\n\n".join(parts)
 
 
 def _check_bash(command: str, depth: int = 0) -> str | None:
@@ -555,6 +645,12 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
                 return _GIT_SKIP_REASON + _PROTOCOL
 
         if exe in ("phi-airgap", "pq"):  # `pq` is the packaged short alias
+            if sub == "run" and _RUN_ASK:
+                kind, why = _run_prompt(words)
+                if kind == "deny":
+                    return why
+                _ASKS.append(why)
+                continue
             if sub in _PQ_BLOCKED:
                 return (
                     f"`phi-airgap {sub}` is the human's command to run, not yours. " + _PROTOCOL
@@ -611,7 +707,9 @@ _READ_DENY = [
     (re.compile(r"\.parquet$", re.IGNORECASE), "Parquet extracts may hold row-grain PHI."),
     (re.compile(r"\.duckdb$", re.IGNORECASE), "DuckDB files may hold row-grain PHI."),
     (
-        re.compile(r"/\.phi-airgap/out/[^/]*\.raw\.", re.IGNORECASE),
+        re.compile(
+            "/(?:" + "|".join(map(re.escape, _WS_DIRS)) + r")/out/[^/]*\.raw\.", re.IGNORECASE
+        ),
         "That is the pre-scrub result. Read the scrubbed .csv/.json instead.",
     ),
     (
@@ -631,6 +729,16 @@ _READ_DENY = [
 
 
 def _check_read(path: str) -> str | None:
+    # readable_root_env: exactly <default_root>/.env, by realpath, so no nested
+    # .env (or a symlink to one elsewhere) is reachable this way.
+    if _ROOT_ENV_READABLE:
+        try:
+            if os.path.realpath(os.path.expanduser(path)) == os.path.join(
+                _workspace_root(), ".env"
+            ):
+                return None
+        except OSError:
+            pass
     for pattern, why in _READ_DENY:
         if pattern.search(path):
             return f"{why} {_PROTOCOL}"
@@ -660,6 +768,21 @@ def _deny(reason: str) -> None:
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
+    sys.exit(0)
+
+
+def _ask(reason: str) -> None:
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
                     "permissionDecisionReason": reason,
                 }
             }
@@ -699,11 +822,22 @@ def main() -> None:
     elif tool in ("Write", "Edit", "MultiEdit"):
         reason = _check_write(str(tool_input.get("file_path", "")), tool_input)
     else:
+        global _CWD
+        _CWD = str(event.get("cwd") or ".")
         command = tool_input.get("command", "")
         reason = _check_bash(command) if command else None
 
     if reason:
         _deny(reason)
+    if _ASKS:
+        # Fail closed: an "ask" in a mode that may not show a prompt is an allow.
+        if event.get("permission_mode") not in _PROMPTING_MODES:
+            _deny(
+                "`run` needs the user's approval, but this session's permission mode "
+                f"({event.get('permission_mode')!r}) may not show a prompt, so it is denied. "
+                "Ask the user to run it with `! phi-airgap run ...`. " + _PROTOCOL
+            )
+        _ask("\n\n".join(_ASKS))
 
     if debug:
         print(f"[phi-airgap] {tool} allowed through", file=sys.stderr)

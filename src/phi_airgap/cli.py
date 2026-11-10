@@ -41,7 +41,7 @@ def cmd_run(args) -> int:
 
     path = Path(args.file)
     if not path.exists():
-        util.die(f"{path} not found. The agent writes SQL to .phi-airgap/q.sql.")
+        util.die(f"{path} not found. The agent writes SQL to {util.workspace_dir_name()}/q.sql.")
     return run.run_file(path, purpose=args.purpose)
 
 
@@ -598,7 +598,8 @@ def _scan_secrets(base: Path, limit: int = 40) -> list[tuple[str, str]]:
     for path in base.rglob("*"):
         if len(out) >= limit:
             break
-        if not path.is_file() or any(p in _SKIP_DIRS for p in path.parts):
+        skip = _SKIP_DIRS | {util.workspace_dir_name()}
+        if not path.is_file() or any(p in skip for p in path.parts):
             continue
         try:
             if path.stat().st_size > 20_000_000:
