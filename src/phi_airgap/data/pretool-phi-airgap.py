@@ -629,8 +629,12 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
                     f"outside your reach. {readable}" + _PROTOCOL
                 )
 
-        if exe == "dbt" and sub in _DBT_BLOCKED:
-            return f"`dbt {sub}` prints result rows and is blocked. " + _PROTOCOL
+        # Global options that take a value (`git -C <dir>`, `dbt --log-level debug`)
+        # put a non-subcommand word first, so "first non-flag word" is not the
+        # subcommand. Judge by presence among the arguments instead.
+        # ponytail: a model/branch literally named `show`/`commit` over-blocks.
+        if exe == "dbt" and (hit := next((w for w in words[1:] if w in _DBT_BLOCKED), None)):
+            return f"`dbt {hit}` prints result rows and is blocked. " + _PROTOCOL
 
         if exe == "git":
             if _GIT_HOOKS_REPOINT.search(seg) or any(t.startswith("GIT_DIR=") for t in tokens):
@@ -638,10 +642,12 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
                     "Re-pointing git hooks (core.hooksPath, hooks.*, GIT_DIR) disables the PHI "
                     "screen on commits and pushes. " + _PROTOCOL
                 )
-            if sub in _GIT_NO_VERIFY_SUBS and "--no-verify" in words:
+            if "--no-verify" in words and _GIT_NO_VERIFY_SUBS.intersection(words[1:]):
                 return _GIT_SKIP_REASON + _PROTOCOL
             # `-n` is --no-verify on commit only (dry-run on push, --no-stat on merge).
-            if sub == "commit" and any(re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", w) for w in words[1:]):
+            if "commit" in words[1:] and any(
+                re.match(r"^-[a-zA-Z]*n[a-zA-Z]*$", w) for w in words[words.index("commit") + 1:]
+            ):
                 return _GIT_SKIP_REASON + _PROTOCOL
 
         if exe in ("phi-airgap", "pq"):  # `pq` is the packaged short alias

@@ -771,6 +771,11 @@ HOOK_DENY = [
     "cat .env.local",
     "databricks sql query --warehouse x",
     "dbt show --select fct_orders",
+    # A global option with a value puts a non-subcommand word first.
+    "dbt --log-level debug show --select fct_orders",
+    "git -C /tmp/repo commit --no-verify -m x",
+    "git -c user.name=x commit -nm x",
+    "git -C repo push --no-verify",
     "phi-airgap dbt show --select fct_orders",
     "dbt run-operation print_table",
     'security find-generic-password -a "$USER" -s phi-airgap-databricks-pat -w',
@@ -957,6 +962,9 @@ HOOK_ALLOW = [
     "pq git install",
     "git push -n origin main",  # -n is dry-run on push
     "git merge -n feature",  # -n is --no-stat on merge
+    "git -C repo commit -m x",
+    "git -C repo push -n origin main",
+    "dbt --log-level debug run --select fct_orders",
     'git commit -am "no-verify is bad"',
 ]
 
