@@ -546,6 +546,85 @@ def _ner_smoke() -> list[str]:
     return fails
 
 
+def _b64(s: str) -> str:
+    import base64
+
+    return base64.b64encode(s.encode()).decode()
+
+
+# Every identifier hides behind an encoding a line scan cannot see: an encoded-word
+# subject, a QP soft break through the SSN, a base64 HTML part with a tag inside
+# the phone number, a PHI filename, a preamble, a forwarded message's headers.
+_EML = f"""Received: from mx.example.org (10.4.22.19) by relay.example.org
+Return-Path: <jane.doe@example.com>
+From: "Doe, Jane" <jane.doe@example.com>
+To: Front Desk <clinic@summahealth.example>
+Subject: =?utf-8?b?{_b64("Results for MRN 1234567")}?=
+Date: Tue, 10 Nov 2026 09:00:00 -0500
+Message-ID: <abc123@mx.example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="B1"
+
+preamble Jane Doe 330-555-0142
+--B1
+Content-Type: multipart/alternative; boundary="B2"
+
+--B2
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Patient: Jane Doe, DOB 03/14/1961, ssn 123-45-=
+6789. Lives at 42 Maple Grove Ave, Akron OH 44304.
+--B2
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: base64
+
+{_b64("<p>Call 330-555-<b>0142</b> re: CSN 987654321</p>")}
+--B2--
+--B1
+Content-Type: application/pdf; name="Doe_Jane_labs.pdf"
+Content-Disposition: attachment; filename="Doe_Jane_labs.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQK
+--B1
+Content-Type: message/rfc822
+
+From: Bob Roe <bob.roe@example.net>
+Subject: fwd MRN 7654321
+
+Dear Mr. Roe, see attached.
+--B1--
+""".encode()
+
+
+def _eml_redaction() -> list[str]:
+    """`phi-airgap scrub x.eml`: decode every part, scrub, drop what can't be scrubbed."""
+    from . import eml, gitscan
+
+    fails = []
+    out, rep = eml.scrub_eml(_EML)
+    decoded = eml.text_of(out)
+    for secret in ["Jane", "Doe", "jane.doe", "123-45", "6789", "03/14/1961", "1234567",
+                   "330-555", "0142", "987654321", "Maple Grove", "44304", "10.4.22.19",
+                   "abc123", "Roe", "7654321", "JVBERi0"]:
+        if secret in decoded or secret.encode() in out:
+            fails.append(f"EML scrub left {secret!r} in the output")
+    for kept in ["summahealth.example", "Subject: Results for <REDACTED:RECORD_NUMBER>",
+                 "Patient: <REDACTED:PERSON>", "Date: Tue, 10 Nov 2026",
+                 "application/pdf part removed"]:
+        if kept not in decoded:
+            fails.append(f"EML scrub should keep {kept!r}")
+    if rep.dropped_parts != ["application/pdf, 9 bytes"]:
+        fails.append(f"EML scrub should report the dropped PDF, got {rep.dropped_parts}")
+    # The git screen must see through a base64 body too.
+    hidden = (b"Content-Type: text/plain\nContent-Transfer-Encoding: base64\n\n"
+              + _b64("ssn 123-45-6789").encode())
+    if not gitscan.scan_blob("m.eml", hidden, run_ner=False).hits:
+        fails.append("GIT SCAN should find an SSN inside a base64 .eml body")
+    return fails
+
+
 def _git_hooks() -> list[str]:
     """`pq git`: staged/range/pre-push scans block on identifiers, honour the allow
     marker and the ignore file, read .docx, block unscannable files, and the
@@ -676,6 +755,9 @@ def _git_hooks() -> list[str]:
 
 HOOK_DENY = [
     'python3 -c "from databricks import sql"',
+    "cat referral.eml",
+    "grep -i mrn mail/Referral.EML",
+    "head -40 'inbox/labs.eml'",
     "cat .envrc",
     "cat ./.env",
     "cat .env",
@@ -809,6 +891,9 @@ HOOK_DENY = [
 ]
 
 HOOK_ALLOW = [
+    "pq scrub referral.eml",
+    "phi-airgap scrub --check mail/referral.eml",
+    "cat referral.scrubbed.eml",
     "git status",
     "cd project && uv run pytest",
     "phi-airgap schema fct_orders",
@@ -872,6 +957,8 @@ HOOK_ALLOW = [
 ]
 
 HOOK_READ_DENY = [
+    "/Users/x/mail/referral.eml",
+    "/Users/x/mail/Referral.EML",
     "/Users/x/project/.envrc",
     "/Users/x/project/.env",
     "/Users/x/project/sub/.env",
@@ -885,6 +972,7 @@ HOOK_READ_DENY = [
 ]
 
 HOOK_READ_ALLOW = [
+    "/Users/x/mail/referral.scrubbed.eml",
     "/Users/x/project/.phi-airgap/out/q.csv",
     "/Users/x/project/.phi-airgap/out/q.json",
     "/Users/x/project/.env.example",
@@ -1125,6 +1213,7 @@ def main() -> int:
     fails += _cardinality_refusal()
     fails += _adopt_roundtrip()
     fails += _ner_smoke()
+    fails += _eml_redaction()
     fails += _run_end_to_end()
     fails += _stats()
     fails += _git_hooks()
@@ -1218,7 +1307,8 @@ def main() -> int:
 
     total = sum(
         map(len, (DENY, ALLOW, HOOK_DENY, HOOK_ALLOW, HOOK_READ_DENY, HOOK_READ_ALLOW))
-    ) + 3 * (len(HOOK_WRITE_DENY) + len(HOOK_WRITE_ALLOW)) + 7 + 3 + 1  # marker writes, _git_hooks
+    ) + 3 * (len(HOOK_WRITE_DENY) + len(HOOK_WRITE_ALLOW)) + 7 + 3 + 1 + 1
+    # ^ marker writes, _git_hooks, _eml_redaction
     for f in fails:
         print(f"FAIL  {f}")
     print(f"\n{total - len(fails)}/{total} cases pass" + (" — PHI-AIRGAP OK" if not fails else ""))

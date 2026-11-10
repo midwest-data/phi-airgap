@@ -222,6 +222,8 @@ def cmd_scrub(args) -> int:
     from . import scrub
 
     path = Path(args.file)
+    if path.suffix.lower() == ".eml":
+        return _scrub_eml(path, args)
     text = path.read_text(errors="replace")
     cleaned, det, ner = scrub.scrub_text(text)
     if args.check:
@@ -245,6 +247,49 @@ def cmd_scrub(args) -> int:
     # --check exits 1 only on deterministic identifier matches, so it is usable
     # as a gate. Without --check the exit code stays 0 for pipe-friendliness.
     return 1 if (args.check and det) else 0
+
+
+def _scrub_eml(path: Path, args) -> int:
+    """MIME-aware: decode, scrub, re-encode; drop what cannot be scrubbed.
+
+    Never writes to stdout and never in place by default: the hook denies the
+    agent raw `*.eml`, so the output goes to `<name>.scrubbed.eml`, the one
+    spelling it may read.
+    """
+    from . import eml
+
+    out, rep = eml.scrub_eml(path.read_bytes())
+    target = None
+    if not args.check:
+        target = path if args.in_place else path.with_name(path.stem + ".scrubbed.eml")
+        target.write_bytes(out)
+        print(f"phi-airgap: scrubbed -> {target}", file=sys.stderr)
+    det, ner = sorted(rep.identifiers), sorted(rep.names)
+    if rep.identifiers:
+        counts = ", ".join(f"{k} x{n}" for k, n in sorted(rep.identifiers.items()))
+        print(f"phi-airgap: IDENTIFIERS in {path}: {counts}", file=sys.stderr)
+    if rep.names:
+        print(f"phi-airgap: names (NER) in {path}: {', '.join(ner)}", file=sys.stderr)
+    for part in rep.dropped_parts:
+        print(f"phi-airgap: removed unscrubbable part: {part}", file=sys.stderr)
+    if rep.dropped_headers:
+        print(
+            f"phi-airgap: dropped {sum(rep.dropped_headers.values())} routing/metadata headers",
+            file=sys.stderr,
+        )
+    if not rep.ner_ran:
+        print(
+            "phi-airgap: WARNING — NER unavailable, so only keyword-anchored names were "
+            "redacted (Patient:/Dear/Mr./Name:). Names in free prose SURVIVE. Install "
+            "`phi-airgap[ner]` before sharing this.",
+            file=sys.stderr,
+        )
+    util.audit(
+        event="scrub_eml", file=str(path), out=str(target) if target else None,
+        identifiers=det, names=ner, dropped_parts=len(rep.dropped_parts), ner_ran=rep.ner_ran,
+    )
+    # --check: exit 1 if the message holds anything the scrubber would remove.
+    return 1 if (args.check and (rep.identifiers or rep.dropped_parts)) else 0
 
 
 # --- pq git: PHI screen for commits and pushes --------------------------------
@@ -781,7 +826,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--service", help="Keychain service name (default: config keychain_service)")
     a.set_defaults(fn=cmd_adopt)
 
-    c = sub.add_parser("scrub", help="run the scrubber over any file")
+    c = sub.add_parser(
+        "scrub", help="run the scrubber over any file (.eml: MIME-aware -> <name>.scrubbed.eml)"
+    )
     c.add_argument("file")
     c.add_argument("-i", "--in-place", action="store_true")
     c.add_argument(
