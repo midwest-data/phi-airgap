@@ -49,6 +49,9 @@ Denied on Bash:
 
 Denied on Read / Grep (path):
 - *.parquet, *.duckdb, .phi-airgap/out/*.raw.*, **/.envrc, **/.env(.local|...)
+- *.eml except *.scrubbed.eml (raw mail; `phi-airgap scrub x.eml` writes the
+  readable x.scrubbed.eml). Shell readers naming a raw .eml are denied too; a
+  directory-wide `rg pattern mail/` is not caught (denylist ceiling).
 
 Denied on Write / Edit / MultiEdit (file_path):
 - everything in the Read list, plus the control-plane files above
@@ -291,6 +294,9 @@ _ENVFILE_TOKEN = re.compile(
 )
 
 _DOC_SUFFIXES = {".env.example", ".env.template", ".env.sample"}
+
+# Raw mail. `x.scrubbed.eml` is the scrubber's output and readable.
+_RAW_EML = re.compile(r"(?<!\.scrubbed)\.eml(?![\w.])", re.IGNORECASE)
 
 
 def _denied_envfile(seg: str) -> bool:
@@ -579,6 +585,12 @@ def _check_bash(command: str, depth: int = 0) -> str | None:
                 "are readable. `phi-airgap doctor` checks credential hygiene. " + _PROTOCOL
             )
 
+        if exe in _READERS and _RAW_EML.search(seg):
+            return (
+                "Raw .eml is unscrubbed mail (headers, bodies, attachments). Run "
+                "`pq scrub <file>.eml`, then read <file>.scrubbed.eml. " + _PROTOCOL
+            )
+
         if exe in _INTERPRETERS or exe.endswith((".py", ".js", ".rb", ".pl")):
             payload = seg + "\n" + heredocs + "\n" + _script_payload(words)
             if m := _PY_FORBIDDEN.search(payload):
@@ -601,6 +613,11 @@ _READ_DENY = [
     (
         re.compile(r"/\.phi-airgap/out/[^/]*\.raw\.", re.IGNORECASE),
         "That is the pre-scrub result. Read the scrubbed .csv/.json instead.",
+    ),
+    (
+        re.compile(r"(?<!\.scrubbed)\.eml$", re.IGNORECASE),
+        "Raw .eml is unscrubbed mail. Run `phi-airgap scrub <file>.eml` and read "
+        "<file>.scrubbed.eml instead.",
     ),
     (
         re.compile(r"(?:^|/)\.envrc$"),

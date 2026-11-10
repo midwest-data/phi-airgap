@@ -126,6 +126,20 @@ identifiers, see below), `phi-airgap dbt run/test` (Keychain token injected, std
 scrubbed, `show`/`run-operation` blocked), `phi-airgap doctor` / `phi-airgap selftest`
 (verify the phi-airgap is intact), `phi-airgap log` (the audit trail).
 
+### Email (.eml)
+
+`phi-airgap scrub referral.eml` is MIME-aware: it decodes every part (base64,
+quoted-printable, RFC 2047 headers), flattens HTML, scrubs, re-encodes, and writes
+`referral.scrubbed.eml`. Headers are allowlisted (From/To/Cc/Reply-To keep only the
+domain; Subject is scrubbed; Received, Message-ID, X-* and the rest are dropped).
+Non-text attachments are **removed**, filename included, and listed on stderr. On
+top of the shared regex floor it redacts keyword-anchored email identifiers
+(`Patient:`/`Dear`/`Mr.` names, DOB, street address, ZIP). Names in free prose need
+the `[ner]` extra; without it the command warns loudly. `--check` exits 1 if the
+message holds anything it would remove. The hook denies the agent any raw `*.eml`
+(Read, Grep, shell readers) and allows `*.scrubbed.eml`; `pq git scan` decodes
+`.eml` bodies too.
+
 ### Registering the Claude Code hook
 
 See [`hooks/claude-code/README.md`](hooks/claude-code/README.md) for the

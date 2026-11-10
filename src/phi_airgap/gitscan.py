@@ -89,6 +89,10 @@ def extract_text(name: str, data: bytes) -> str:
             )
         except Exception as e:
             raise Unscannable(f"pdf: unreadable ({type(e).__name__})") from e
+    if ext == ".eml":  # base64/QP bodies and encoded-word headers hide from a line scan
+        from . import eml
+
+        return eml.text_of(data)
     if ext in DOC_EXTS:
         raise Unscannable(f"{ext}: legacy binary format; save as {ext}x")
     if b"\0" in data[:8192]:
