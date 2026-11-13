@@ -1190,6 +1190,58 @@ def _stats() -> list[str]:
     return fails
 
 
+def _dbt_node_names() -> list[str]:
+    """`dbt run --select <node>` resolves an aliased model or seed by its node
+    name, every hit is still classified, and an unknown or `:` selector dies."""
+    import contextlib
+    import io
+
+    from . import cli, meta
+
+    fails = []
+    manifest = {"nodes": {
+        "model.demo.reporting__agg_sales": {
+            "resource_type": "model", "name": "reporting__agg_sales", "alias": "agg_sales",
+            "database": "warehouse", "schema": "reporting",
+            "unique_id": "model.demo.reporting__agg_sales"},
+        "seed.demo.analytics__region_map": {
+            "resource_type": "seed", "name": "analytics__region_map", "alias": "region_map",
+            "database": "warehouse", "schema": "analytics",
+            "unique_id": "seed.demo.analytics__region_map"},
+    }}
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        index = meta._from_manifest(d / "manifest.json")
+        if index.get("warehouse.reporting.agg_sales", {}).get("dbt_name") != \
+                "reporting__agg_sales":
+            fails.append(f"META should store the dbt node name on its relation: {index}")
+        cache = d / "cache.json"
+        cache.write_text(json.dumps(index))
+        old = meta.cache_path, util.POLICY_FILE
+        meta.cache_path = lambda: cache
+        util.POLICY_FILE = util.DATA / "policy.example.yml"
+        try:
+            def targets(sel):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        return cli._green_dbt_targets([sel])
+                    except SystemExit:
+                        return None
+
+            # GREEN only if the aliased relation was resolved AND classified.
+            if targets("reporting__agg_sales") != ["warehouse.reporting.agg_sales"]:
+                fails.append("DBT --select <aliased model node> should resolve and classify")
+            if targets("+analytics__region_map") != []:
+                fails.append("DBT --select <aliased seed node> should resolve (AMBER)")
+            for sel in ("no_such_node", "tag:nightly"):
+                if targets(sel) is not None:
+                    fails.append(f"DBT --select {sel} should die, not resolve")
+        finally:
+            meta.cache_path, util.POLICY_FILE = old
+    return fails
+
+
 def _hook_raw(stdin: str, env: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(HOOK)], input=stdin, capture_output=True, text=True, env=env,
@@ -1291,6 +1343,7 @@ def main() -> int:
     fails += _site_options()
     fails += _run_end_to_end()
     fails += _stats()
+    fails += _dbt_node_names()
     fails += _git_hooks()
 
     if HOOK.exists():
