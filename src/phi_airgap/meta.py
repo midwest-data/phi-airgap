@@ -42,6 +42,12 @@ def _from_manifest(path: Path) -> dict:
         ).lower()
         entry = out.setdefault(key, {"columns": {}})
         entry["kind"] = node.get("resource_type", "")
+        # `dbt --select` takes the node name, which differs from the relation
+        # whenever the node sets an alias; keep it so find() can resolve it.
+        if name := node.get("name"):
+            entry["dbt_name"] = name.lower()
+        if uid := node.get("unique_id"):
+            entry["unique_id"] = uid
         if desc := (node.get("description") or "").strip():
             entry["description"] = desc
         if refs := node.get("depends_on", {}).get("nodes"):
@@ -169,7 +175,9 @@ def load() -> dict:
 
 
 def find(pattern: str, index: dict | None = None) -> dict:
-    """Match a relation pattern loosely: bare table name, schema.table, or glob."""
+    """Match a relation pattern loosely: bare table name, schema.table, dbt node
+    name, or glob. Matches are unioned, so a node-name hit never drops a
+    relation-name hit: callers that classify every hit stay fail-closed."""
     index = index if index is not None else load()
     pat = pattern.lower()
     if "*" not in pat and "?" not in pat:
@@ -178,7 +186,9 @@ def find(pattern: str, index: dict | None = None) -> dict:
     for key, entry in index.items():
         table = key.rsplit(".", 1)[-1]
         schema_table = ".".join(key.split(".")[-2:])
-        if fnmatch(key, pat) or fnmatch(schema_table, pat) or fnmatch(table, pat):
+        node = entry.get("dbt_name", "")
+        if (fnmatch(key, pat) or fnmatch(schema_table, pat) or fnmatch(table, pat)
+                or (node and fnmatch(node, pat))):
             hits[key] = entry
     return hits
 
