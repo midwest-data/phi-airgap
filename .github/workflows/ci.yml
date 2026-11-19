@@ -45,3 +45,17 @@ jobs:
           python-version: "3.12"
       - run: pip install '.[ner]'
       - run: phi-airgap selftest
+
+  # install.sh: the curl one-liner, run against this commit on a clean runner.
+  install-script:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh install.sh
+        env:
+          PHI_AIRGAP_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: ~/.local/bin/phi-airgap selftest
+        working-directory: ${{ runner.temp }}
