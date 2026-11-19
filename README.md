@@ -48,12 +48,18 @@ careless egress, nothing more.
 ## Install
 
 ```bash
-# core: the gate + hook only (fast, no heavy deps)
-pip install phi-airgap
+# one line: installs uv if missing, then phi-airgap (+ Python 3.12) as an isolated CLI
+curl -fsSL https://raw.githubusercontent.com/midwest-data/phi-airgap/main/install.sh | sh
 
-# with the NER alarm and the Databricks adapter
-pip install "phi-airgap[ner,databricks]"
+# with the NER alarm and the Databricks adapter (PHI_AIRGAP_REF=<branch|tag|sha> pins a version)
+curl -fsSL https://raw.githubusercontent.com/midwest-data/phi-airgap/main/install.sh \
+  | PHI_AIRGAP_EXTRAS=ner,databricks sh
+
+# already have uv? skip the script
+uv tool install --python 3.12 "phi-airgap @ git+https://github.com/midwest-data/phi-airgap"
 ```
+
+Upgrade by re-running the same line. Uninstall: `uv tool uninstall phi-airgap`.
 
 **Python is pinned to `>=3.12,<3.13`.** The `[ner]` extra pulls spaCy and the
 `en_core_web_lg` model (~500 MB), whose wheels do not resolve on 3.13+. The core
