@@ -6,8 +6,9 @@
 default_root: "."
 
 # Warehouse seam. `adapter` selects a DBAPI adapter from phi_airgap/adapters/;
-# `sql_dialect` is the sqlglot dialect the gate parses in. Only "databricks"
-# ships — add phi-airgap/adapters/<name>.py for another warehouse (~30 lines).
+# `sql_dialect` is the sqlglot dialect the gate parses in.
+# Postgres: adapter: postgres, sql_dialect: postgres, dsn_env: PHI_AIRGAP_PG_DSN.
+# Optional statement_timeout: 15s; network_catalogs lists schemas for Postgres.
 adapter: databricks
 sql_dialect: databricks
 

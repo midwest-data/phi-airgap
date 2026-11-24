@@ -72,6 +72,7 @@ def _from_information_schema(catalogs: list[str]) -> dict:
     """Authoritative column list. Metadata only — no user data is read."""
     from . import run  # local import: keeps `phi-airgap schema` off the connector path
 
+    postgres = util.config().get("adapter") == "postgres"
     out: dict[str, dict] = {}
     sql_tmpl = (
         "select lower(table_catalog), lower(table_schema), lower(table_name), "
@@ -82,12 +83,22 @@ def _from_information_schema(catalogs: list[str]) -> dict:
     with run.connect() as conn:
         for cat in catalogs:
             try:
-                cols, rows = run.fetch(conn, sql_tmpl.format(cat=cat))
+                if postgres:
+                    # network_catalogs names schemas on Postgres; bind names as values.
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "select table_catalog, table_schema, table_name, column_name, "
+                            "data_type, NULL from information_schema.columns "
+                            "where table_schema = %s", (cat,)
+                        )
+                        rows = cur.fetchall()
+                else:
+                    cols, rows = run.fetch(conn, sql_tmpl.format(cat=cat))
             except Exception as e:  # a catalog we cannot see is not fatal
-                print(f"phi-airgap: skipping catalog {cat}: {type(e).__name__}: {e}")
+                print(f"phi-airgap: skipping catalog {cat}: {type(e).__name__}")
                 continue
             for c, s, t, col, dtype, comment in rows:
-                entry = out.setdefault(f"{c}.{s}.{t}", {"columns": {}})
+                entry = out.setdefault(f"{s}.{t}" if postgres else f"{c}.{s}.{t}", {"columns": {}})
                 entry["columns"][col] = {
                     "type": dtype or "",
                     "description": (comment or "").strip(),
@@ -103,16 +114,23 @@ def add_stats(conn, index: dict, keys: list[str], max_columns: int = 60) -> int:
     Returns the number of relations updated."""
     from . import run  # local import: keeps `phi-airgap schema` off the connector path
 
+    postgres = util.config().get("adapter") == "postgres"
+    def quote(name):
+        mark = '"' if postgres else '`'
+        return mark + name.replace(mark, mark * 2) + mark
+
     done = 0
     for key in keys:
         cols = sorted(index.get(key, {}).get("columns", {}))[:max_columns]
         if not cols:
             continue
-        sql = "select count(*)" + "".join(f", count(distinct `{c}`)" for c in cols) + f" from {key}"
+        relation = ".".join(quote(part) for part in key.split(".")) if postgres else key
+        counts = "".join(f", count(distinct {quote(c)})" for c in cols)
+        sql = f"select count(*){counts} from {relation}"
         try:
             _, rows = run.fetch(conn, sql, 1)
         except Exception as e:  # a relation we cannot count is not fatal
-            print(f"phi-airgap: skipping stats for {key}: {type(e).__name__}: {e}")
+            print(f"phi-airgap: skipping stats for {key}: {type(e).__name__}")
             continue
         if not rows:
             continue

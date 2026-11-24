@@ -24,8 +24,7 @@ Snowflake adapter is roughly:
 
 then set `adapter: postgres` and `sql_dialect: postgres` in config.
 
-# ponytail: only the databricks adapter ships; the seam is the extension point,
-# add others on demand.
+Databricks and Postgres adapters ship; the seam supports additional drivers.
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ def get_adapter(name: str = "databricks") -> Adapter:
             importlib.import_module(f"{__name__}.{name}")
         except ImportError as e:
             raise ImportError(
-                f"No warehouse adapter '{name}'. Built-in: 'databricks' "
+                f"No warehouse adapter '{name}'. Built-in: 'databricks', 'postgres' "
                 f"(install with `pip install phi-airgap[databricks]`). "
                 f"For another warehouse, add phi-airgap/adapters/{name}.py — see this "
                 f"module's docstring for the ~30-line DBAPI contract. ({e})"
