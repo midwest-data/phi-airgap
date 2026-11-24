@@ -28,8 +28,8 @@ enforce that:
    enforces "the agent never runs the query, never reads a credential, never
    opens a raw extract." Instructions are the belt; the hook is the braces.
 
-The engine is warehouse-agnostic behind a small DBAPI adapter seam. A Databricks
-reference adapter ships; adding another warehouse is ~30 lines.
+The engine is warehouse-agnostic behind a small DBAPI adapter seam. Databricks and Postgres
+adapters ship.
 
 ---
 
@@ -254,27 +254,32 @@ scanned documents, and a baseline file for pre-existing findings.
 
 ## The warehouse seam
 
-`config.adapter` selects a DBAPI adapter; `config.sql_dialect` sets the sqlglot
-dialect the gate parses in. Only `databricks` ships. Any PEP 249 driver
-satisfies the contract (`connect(cfg)` → a connection with
-`cursor()`/`execute`/`description`/`fetchmany`), so a Postgres or Snowflake
-adapter is roughly:
+`config.adapter` selects the DBAPI adapter and `config.sql_dialect` selects the
+SQL parser dialect. Databricks and Postgres ship.
 
-```python
-# src/phi_airgap/adapters/postgres.py
-import sys
-from . import register
+### Postgres
 
-def connect(cfg):
-    import psycopg
-    return psycopg.connect(cfg["host"])
+Install `phi-airgap[postgres]` and configure:
 
-register("postgres", sys.modules[__name__])
+```yaml
+adapter: postgres
+sql_dialect: postgres
+dsn_env: PHI_AIRGAP_PG_DSN
+statement_timeout: 15s
+network_catalogs: [public]  # Postgres schema names
 ```
 
-Then set `adapter: postgres` and `sql_dialect: postgres`. See
-[`src/phi_airgap/adapters/__init__.py`](src/phi_airgap/adapters/__init__.py) for the
-full contract.
+Set the named DSN environment variable only in the trusted broker process,
+never the agent sandbox. Use a least-privilege read-only database role. The
+adapter opens sessions with `default_transaction_read_only=on` and a timeout.
+`refresh` reads `information_schema.columns`; `refresh --stats` also collects
+counts. Every connection verifies that the effective role is not superuser and
+has no table INSERT/UPDATE/DELETE/TRUNCATE or schema CREATE privileges.
+Postgres queries must reference a named table, use only the gate's small
+function allowlist, and reference at most one non-GREEN relation occurrence.
+Whole-row references and system catalog queries are denied. Metadata refresh
+uses trusted adapter queries directly. DML, SELECT INTO and row locks are denied
+anywhere in a query tree. The existing scrubber still applies.
 
 ---
 

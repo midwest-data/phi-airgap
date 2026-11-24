@@ -51,6 +51,7 @@ from fnmatch import fnmatch
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from . import util
 from .scrub import HARD_DENY
@@ -67,18 +68,47 @@ DIALECT = "databricks"
 # R8: aggregate functions that return one or more INPUT VALUES rather than a
 # statistic. Over a non-GREEN table they are a row dump wearing GROUP BY.
 _VALUE_AGGS = (
-    exp.ArrayAgg, exp.ArrayUniqueAgg, exp.GroupConcat, exp.AnyValue, exp.First, exp.Last,
-    exp.FirstValue, exp.LastValue, exp.ApproxTopK, exp.Mode, exp.ArgMax, exp.ArgMin,
+    exp.ArrayAgg,
+    exp.ArrayUniqueAgg,
+    exp.GroupConcat,
+    exp.AnyValue,
+    exp.First,
+    exp.Last,
+    exp.FirstValue,
+    exp.LastValue,
+    exp.ApproxTopK,
+    exp.Mode,
+    exp.ArgMax,
+    exp.ArgMin,
 )
 _VALUE_AGG_NAMES = {
-    "collect_list", "collect_set", "array_agg", "string_agg", "listagg", "any_value", "first",
-    "last", "first_value", "last_value", "mode", "approx_top_k", "group_concat", "max_by",
-    "min_by", "arg_max", "arg_min",
+    "collect_list",
+    "collect_set",
+    "array_agg",
+    "string_agg",
+    "listagg",
+    "any_value",
+    "first",
+    "last",
+    "first_value",
+    "last_value",
+    "mode",
+    "approx_top_k",
+    "group_concat",
+    "max_by",
+    "min_by",
+    "arg_max",
+    "arg_min",
 }
 # Order statistics return a member of the input set, so they get the min/max
 # typing rule: fine over a number or a date, one row's value over anything else.
 _ORDER_STATS = (
-    exp.Min, exp.Max, exp.PercentileDisc, exp.PercentileCont, exp.Median, exp.Quantile,
+    exp.Min,
+    exp.Max,
+    exp.PercentileDisc,
+    exp.PercentileCont,
+    exp.Median,
+    exp.Quantile,
     exp.ApproxQuantile,
 )
 _NUMERIC_OR_DATE_TYPE = re.compile(
@@ -284,10 +314,30 @@ def _value_agg(e: exp.Expression) -> str | None:
     return None
 
 
+def _where_operand(e: exp.Expression) -> bool:
+    """A bare column, or date_trunc('month'|'quarter'|'year', column)."""
+    if isinstance(e, exp.Column):
+        return True
+    if isinstance(e, (exp.DateTrunc, exp.TimestampTrunc)):
+        unit = (e.args.get("unit") or exp.Var(this="")).name.lower().strip("'")
+        return unit in {"month", "quarter", "year"} and isinstance(e.this, exp.Column)
+    return False
+
+
 def _is_count(e: exp.Expression) -> bool:
     """A count-shaped aggregate: count, count_if, count(...) filter (where ...),
     or sum(case when ... then 1 else 0 end) — anything whose value is a number
-    of rows, so that k-anonymity suppression can act on it."""
+    of rows, so that k-anonymity suppression can act on it.
+
+    Postgres: only a literal count(*) counts. A FILTER, a CASE sum or a
+    count(NULL) can be forced to 0 for every group, which switches k-anonymity
+    off and returns single-row groups at row grain."""
+    if DIALECT == "postgres":
+        return (
+            isinstance(e, exp.Count)
+            and isinstance(e.this, (exp.Star, exp.Column))
+            and not e.args.get("distinct")
+        )
     if isinstance(e, (exp.Count, exp.CountIf)):
         return True
     if isinstance(e, exp.Filter):
@@ -548,6 +598,193 @@ def check(
         )
         return v
 
+    if any(isinstance(n, (exp.DML, exp.DDL, exp.Into, exp.Lock)) for n in tree.walk()):
+        v.reasons.append("Data modification, SELECT INTO and row locks are denied.")
+
+    # PostgreSQL functions can execute SQL, read files or change session state.
+    if DIALECT == "postgres":
+        safe_functions = {
+            exp.Count,
+            exp.Sum,
+            exp.Avg,
+            exp.And,  # WHERE conjunctions; OR stays denied (it pads a target row)
+            exp.Coalesce,
+            exp.DateTrunc,
+            exp.TimestampTrunc,
+            exp.Extract,
+            exp.Cast,
+            exp.Round,
+            exp.Lower,
+            exp.Upper,
+            exp.Case,
+            exp.If,
+        }
+        if any(type(n) not in safe_functions for n in tree.find_all(exp.Func)):
+            v.reasons.append("Function outside the PostgreSQL allowlist is denied.")
+        # WHERE padding: `where reps in (805, 0)` plus rows whose value is NULL
+        # makes sum() return one learner's value while count(*) >= k. Under
+        # postgres WHERE is only AND-joined `column <op> literal` comparisons,
+        # and a filtered column may not also be aggregated.
+        # ponytail: dominance (a range that isolates the extreme row) remains, per
+        # SECURITY.md k-anonymity limits; owner accepts it explicitly.
+        for select_node in tree.find_all(exp.Select):
+            where = select_node.args.get("where")
+            if where is None:
+                continue
+            filtered = set()
+            stack = [where.this]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, exp.Paren):
+                    stack.append(node.this)
+                    continue
+                if isinstance(node, exp.And):
+                    stack += [node.left, node.right]
+                    continue
+                ok = False
+                if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                    sides = [node.left, node.right]
+                    cols = [s for s in sides if _where_operand(s)]
+                    lits = [
+                        s
+                        for s in sides
+                        if isinstance(s, exp.Literal)
+                        or (isinstance(s, exp.Neg) and isinstance(s.this, exp.Literal))
+                    ]
+                    ok = len(cols) == 1 and len(lits) == 1
+                    if ok:
+                        filtered |= {c.name.lower() for c in cols[0].find_all(exp.Column)}
+                if not ok:
+                    v.reasons.append(
+                        f"WHERE `{node.sql(dialect=DIALECT)}`: only AND-joined comparisons of a "
+                        "bare column (or a month/quarter/year truncation) with a literal are "
+                        "allowed."
+                    )
+                    break
+            aggregated = {
+                c.name.lower()
+                for agg in tree.find_all(exp.Sum, exp.Avg)
+                for c in agg.find_all(exp.Column)
+            }
+            if filtered & aggregated:
+                v.reasons.append(
+                    "A column may not be both filtered in WHERE and aggregated: "
+                    + ", ".join(sorted(filtered & aggregated))
+                )
+        # GROUP BY padding: `group by streak in (500, 1115)` does what a denied
+        # WHERE did. Group keys and plain outputs are bare columns or a
+        # month/quarter/year truncation of one.
+        for select_node in tree.find_all(exp.Select):
+            group = select_node.args.get("group")
+            exprs = list(group.expressions) if group else []
+            for e in select_node.expressions:
+                inner_e = e.unalias() if isinstance(e, exp.Alias) else e
+                if not inner_e.find(exp.AggFunc):
+                    exprs.append(inner_e)
+            for g in exprs:
+                if isinstance(g, exp.Literal) and g.is_int:
+                    continue  # ordinal, resolved to a projection checked above
+                if not _where_operand(g):
+                    v.reasons.append(
+                        f"Group key or output `{g.sql(dialect=DIALECT)}` must be a bare column "
+                        "or a month/quarter/year truncation of one."
+                    )
+                    break
+            # NULL padding: rows with a NULL value are counted by count(*) but not
+            # by sum/avg. Every sum/avg(col) needs count(col) projected beside it,
+            # and k-anonymity then applies to that count too.
+            projected = [
+                e.unalias() if isinstance(e, exp.Alias) else e for e in select_node.expressions
+            ]
+            counted = {
+                p.this.name.lower()
+                for p in projected
+                if isinstance(p, exp.Count) and isinstance(p.this, exp.Column)
+            }
+            for agg in select_node.find_all(exp.Sum, exp.Avg):
+                col = agg.this
+                while isinstance(col, exp.Cast):
+                    col = col.this
+                if isinstance(col, exp.Column) and col.name.lower() not in counted:
+                    v.reasons.append(
+                        f"`{agg.sql(dialect=DIALECT)}` needs `count({col.name})` projected "
+                        "beside it, so rows without a value cannot pad the group."
+                    )
+                    break
+        # An aggregate over arithmetic can be an indicator that selects one row:
+        # sum(score * (1 - sign(abs(reps - 805)))) returns that learner's score.
+        # Anywhere in the statement (SELECT, HAVING, ORDER BY), sum/avg/min/max
+        # take a bare column, optionally cast; count takes only *.
+        for agg in tree.find_all(exp.Sum, exp.Avg):
+            arg = agg.this
+            while isinstance(arg, exp.Cast):
+                arg = arg.this
+            if not isinstance(arg, exp.Column):
+                v.reasons.append(
+                    f"`{agg.sql(dialect=DIALECT)}`: an aggregate over an expression can single "
+                    "out one row. Aggregate a bare column."
+                )
+                break
+        relation_names = {
+            name.lower()
+            for t in tree.find_all(exp.Table, exp.CTE, exp.Subquery)
+            for name in (t.alias_or_name, t.name)
+            if name
+        }
+        if any(c.name.lower() in relation_names for c in tree.find_all(exp.Column)):
+            v.reasons.append("Whole-row table or alias references are denied.")
+
+    if DIALECT == "postgres":
+        if re.search(r"/\*(?:(?!\*/).)*?/\*", sql, re.S):
+            v.reasons.append("Nested block comments are denied in PostgreSQL.")
+        if any(alias.args.get("columns") for alias in tree.find_all(exp.TableAlias)):
+            v.reasons.append("Source column renaming is denied in PostgreSQL.")
+        source = tree.args.get("from_")
+        if (
+            not isinstance(tree, exp.Select)
+            or source is None
+            or not isinstance(source.this, exp.Table)
+            or any(
+                tree.find_all(
+                    exp.Join, exp.Values, exp.Lateral, exp.Subquery, exp.CTE, exp.SetOperation
+                )
+            )
+        ):
+            v.reasons.append(
+                "PostgreSQL queries require exactly one named table without joins or subqueries."
+            )
+        if any(
+            not (isinstance(star.parent, exp.Count) and star.parent.this is star)
+            for star in tree.find_all(exp.Star)
+        ):
+            v.reasons.append("Stars outside count(*) are denied in PostgreSQL.")
+
+    if DIALECT == "postgres" or index is not None:
+        for scope in traverse_scope(tree):
+            for col in scope.columns:
+                if col.is_star:
+                    continue  # Databricks output stars are screened below.
+                sources = [
+                    source
+                    for alias, source in scope.sources.items()
+                    if not col.table or alias.lower() == col.table.lower()
+                ]
+                known = False
+                for source in sources:
+                    if isinstance(source, Scope):
+                        names = source.expression.named_selects
+                    else:
+                        key = ".".join(part.name.lower() for part in source.parts)
+                        # PostgreSQL must match the actual relation, never another schema's suffix.
+                        columns = ((index or {}).get(key) or {}).get("columns", {})
+                        names = columns if DIALECT == "postgres" else _cached_columns([key], index)
+                    if col.name.lower() in {name.lower() for name in names}:
+                        known = True
+                if not known:
+                    v.reasons.append(
+                        "Column reference is absent from the referenced relation's metadata."
+                    )
+
     # R1 — named relations only. A path read or table function cannot be
     # classified, so it is denied before anything else is considered.
     if m := _PATH_READ.search(sql):
@@ -561,6 +798,25 @@ def check(
             f"Table source `{src}` has no resolvable relation name, so it cannot be "
             "classified. Denied."
         )
+
+    if DIALECT == "postgres":
+        if not named:
+            v.reasons.append("Queries without named tables are denied.")
+        if any(
+            sch.startswith("pg_") or sch == "information_schema" or tbl.startswith("pg_")
+            for _, sch, tbl in named
+        ):
+            v.reasons.append("PostgreSQL system catalog queries are denied.")
+        # Count occurrences, not unique names: a self-join multiplies counts too.
+        if (
+            sum(
+                classify((t.catalog or "").lower(), (t.db or "").lower(), t.name.lower(), pol)
+                != "GREEN"
+                for t in tree.find_all(exp.Table)
+            )
+            > 1
+        ):
+            v.reasons.append("More than one non-GREEN relation is denied.")
 
     for cat, sch, tbl in named:
         v.tables[".".join(p for p in (cat, sch, tbl) if p)] = classify(cat, sch, tbl, pol)
@@ -791,6 +1047,8 @@ def check(
                     "inspect a join, use `count(*) ... GROUP BY <join keys>` instead of "
                     "peeking at rows."
                 )
+            if DIALECT == "postgres" and select.find(exp.Fetch):
+                v.reasons.append("FETCH FIRST is denied; use LIMIT (at least k) instead.")
             # R10 — existence probes: a tiny LIMIT or a HAVING that selects
             # small cells emits identifying group keys with `<k` beside them.
             if aggregated:
@@ -810,17 +1068,25 @@ def check(
 
             # R14 — a group key that is (nearly) unique per row is a person
             # key, whatever it is called. Needs row/distinct counts in the cache.
+            # Every column inside a group-key expression counts too: `fluency_score
+            # + 0` is the same person key as `fluency_score`.
+            r14_keys = set(keys)
+            group = select.args.get("group")
+            for g in group.expressions if group else []:
+                if isinstance(g, exp.Literal) and g.is_int:
+                    idx = int(g.name) - 1
+                    g = select.expressions[idx] if 0 <= idx < len(select.expressions) else g
+                r14_keys |= {c.name.lower() for c in g.find_all(exp.Column)}
             for entry in _cached_entries(list(sensitive), index):
                 rc = entry.get("row_count")
                 if not rc:
                     continue
-                for key in keys:
+                for key in r14_keys:
                     col = entry.get("columns", {}).get(key, {})
                     dc = col.get("distinct_count")
                     if dc and not is_allowed(key) and dc >= 0.5 * rc:
                         v.reasons.append(
-                            f"Group key `{key}` has {dc} distinct values over {rc} rows in the "
-                            "cache — that is a person key, and grouping by it enumerates "
+                            f"Group key `{key}` is a person key, and grouping by it enumerates "
                             "individuals. Add it to deny_columns."
                         )
 
@@ -834,6 +1100,8 @@ def _projects_count(select: exp.Select) -> bool:
     Name matching against policy count_columns is deliberately NOT done here:
     `count(*) * 100 as n` defeats k-anon while wearing a count-like name.
     """
-    return any(
-        _is_count(e.unalias() if isinstance(e, exp.Alias) else e) for e in select.expressions
-    )
+    inner = [e.unalias() if isinstance(e, exp.Alias) else e for e in select.expressions]
+    if DIALECT == "postgres":
+        # count(col) can be 0 for a group; only count(*) bounds the group size.
+        return any(isinstance(e, exp.Count) and isinstance(e.this, exp.Star) for e in inner)
+    return any(_is_count(e) for e in inner)
